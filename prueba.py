@@ -320,8 +320,9 @@ with st.expander("🔍 Ver Logs de Diagnóstico"):
     st.code("\n".join(ss.diag[-100:]), language="log")
 
 # --- Auto-refresco ---
-time.sleep(1)
+time.sleep(30)
 st.rerun()
+
 
 
 
