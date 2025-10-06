@@ -53,8 +53,8 @@ def login_box():
 BROKER_HOST    = "pinkhoney-186ef38b.a02.usw2.aws.hivemq.cloud"
 BROKER_PORT_WS = 8884
 BROKER_WS_PATH = "/mqtt"
-BROKER_USER    = "PON_TU_USUARIO_AQUI" # <-- Reemplaza
-BROKER_PASS    = "PON_TU_PASSWORD_AQUI" # <-- Reemplaza
+BROKER_USER    = "AdrianFB" # <-- Reemplaza
+BROKER_PASS    = "Ab451278" # <-- Reemplaza
 
 DEV_ID = "drone-001"
 T_CMD     = f"drone/{DEV_ID}/cmd"
@@ -320,6 +320,7 @@ with st.expander("🔍 Ver Logs de Diagnóstico"):
     st.code("\n".join(ss.diag[-100:]), language="log")
 
 # --- Auto-refresco ---
-time.sleep(1)
+time.sleep(8)
 st.rerun()
+
 
