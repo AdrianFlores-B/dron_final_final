@@ -1,11 +1,11 @@
-# Streamlit + HiveMQ Cloud — Versión Estable con Arquitectura de Colas
+# Streamlit + HiveMQ Cloud — Versión Estable y Corregida (Sin Hilos)
 import streamlit as st
-import time, threading, ssl, os, json
-from collections import deque
+import time, ssl, os, json
 from datetime import datetime, date
 import pandas as pd
 import paho.mqtt.client as mqtt
 
+# Pydeck es opcional si no se instala
 try:
     import pydeck as pdk
     PYDECK_AVAILABLE = True
@@ -13,105 +13,290 @@ except ImportError:
     PYDECK_AVAILABLE = False
 
 # ==============================================================================
-# COLAS SEGURAS PARA COMUNICACIÓN ENTRE HILOS (LA SOLUCIÓN CLAVE)
+# LÓGICA DE LA APLICACIÓN (ARQUITECTURA SIN HILOS)
 # ==============================================================================
-LOG_QUEUE = deque(maxlen=400)
-DATA_QUEUE = deque(maxlen=200)
-STATUS_QUEUE = deque(maxlen=5)
 
-# ==============================================================================
-# LÓGICA DE LA APLICACIÓN
-# ==============================================================================
+# ===================== SIMPLE LOGIN (PIN) =====================
+def get_pin_source():
+    try:
+        pin = st.secrets.get("APP_PIN", None)
+        if pin: return str(pin).strip()
+    except Exception: pass
+    pin_env = os.environ.get("APP_PIN", "").strip()
+    if pin_env: return pin_env
+    return "1234"
+
+APP_PIN = get_pin_source()
+
+def is_editor():
+    return st.session_state.get("auth_ok", False)
+
+def login_box():
+    with st.sidebar:
+        st.markdown("### 🔐 Acceso de edición")
+        if not is_editor():
+            pin_try = st.text_input("PIN (numérico)", type="password", help="Pide el PIN al administrador")
+            if st.button("Ingresar", use_container_width=True):
+                if pin_try and pin_try.strip() == APP_PIN:
+                    st.session_state.auth_ok = True
+                    st.success("Acceso concedido"); st.rerun()
+                else: st.error("PIN incorrecto")
+        else:
+            st.success("Sesión: Editor")
+            if st.button("Cerrar sesión", use_container_width=True):
+                st.session_state.auth_ok = False; st.rerun()
+
 # -------- HiveMQ Cloud creds (ACTUALIZA ESTOS VALORES) --------
 BROKER_HOST    = "pinkhoney-186ef38b.a02.usw2.aws.hivemq.cloud"
 BROKER_PORT_WS = 8884
 BROKER_WS_PATH = "/mqtt"
-BROKER_USER    = "AdrianFB"
-BROKER_PASS    = "Ab451278"
+BROKER_USER    = "AdrianFB" # <-- Reemplaza
+BROKER_PASS    = "Ab451278" # <-- Reemplaza
 
 DEV_ID = "drone-001"
-T_CMD = f"drone/{DEV_ID}/cmd"; T_STATE = f"drone/{DEV_ID}/state"; T_INFO = f"drone/{DEV_ID}/info"; T_PREVIEW = f"drone/{DEV_ID}/preview"; T_LOGPART = f"drone/{DEV_ID}/log/part"; T_EVENTS = f"drone/{DEV_ID}/events"
+T_CMD     = f"drone/{DEV_ID}/cmd"
+T_STATE   = f"drone/{DEV_ID}/state"
+T_INFO    = f"drone/{DEV_ID}/info"
+T_PREVIEW = f"drone/{DEV_ID}/preview"
+T_LOGPART = f"drone/{DEV_ID}/log/part"
+T_EVENTS  = f"drone/{DEV_ID}/events"
 
-# -------- HILO DE MQTT (AHORA NO TOCA st.session_state) --------
-def mqtt_client_thread(insecure_tls: bool):
-    """Función que se ejecuta en un hilo separado para manejar MQTT."""
-    def log(message):
-        LOG_QUEUE.append(f"{datetime.now().strftime('%H:%M:%S')}  {message}")
-    
-    def on_connect(c, u, flags, rc, properties=None):
-        STATUS_QUEUE.append(rc == 0)
-        rc_map = {0: "OK", 1: "Proto incorrecto", 2: "ID cliente inválido", 3: "Servidor no disponible", 4: "Usuario/Pass incorrecto", 5: "No autorizado"}
-        log(f"on_connect rc={rc} ({rc_map.get(rc, 'Desconocido')})")
-        if rc == 0:
-            c.subscribe([(T_STATE,1),(T_INFO,1),(T_PREVIEW,1),(T_LOGPART,1),(T_EVENTS,0)])
-            log("Suscrito a tópicos.")
-
-    def on_disconnect(c, u, rc, properties=None):
-        STATUS_QUEUE.append(False); log(f"on_disconnect rc={rc}")
-
-    def on_message(c, u, msg):
-        try:
-            if msg.topic == T_PREVIEW:
-                payload = msg.payload.decode("utf-8")
-                data = json.loads(payload)
-                if isinstance(data, list) and data:
-                    DATA_QUEUE.append(data); log(f"Recibidas {len(data)} filas de preview.")
-        except Exception as e: log(f"Error procesando mensaje @{msg.topic}: {e}")
-
-    log("Iniciando hilo de cliente MQTT...")
-    try:
-        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"st-web-{int(time.time())}", transport="websockets")
-        client.username_pw_set(BROKER_USER, BROKER_PASS)
-        client.ws_set_options(path=BROKER_WS_PATH)
-        client.tls_set(cert_reqs=ssl.CERT_REQUIRED)
-        client.tls_insecure_set(bool(insecure_tls))
-        client.on_connect = on_connect; client.on_disconnect = on_disconnect; client.on_message = on_message
-        client.reconnect_delay_set(min_delay=1, max_delay=15)
-        log(f"Intentando conectar a {BROKER_HOST}...")
-        client.connect(BROKER_HOST, BROKER_PORT_WS, keepalive=60)
-        client.loop_forever(retry_first_connection=True)
-    except Exception as e:
-        log(f"EXCEPCIÓN FATAL en hilo MQTT: {type(e).__name__} - {e}"); STATUS_QUEUE.append(False)
-
-# -------- Interfaz de Streamlit --------
-st.set_page_config(page_title="Control de Dron", layout="wide")
+# -------- Interfaz y Lógica Principal de Streamlit --------
+st.set_page_config(page_title="Ubicacion y Control de Avispas", layout="wide")
 st.title("🛰️ Ubicacion y Control de Avispas")
 
 ss = st.session_state
+
+# Inicialización del estado de la sesión
 if "init" not in ss:
-    ss.init = True; ss.mqtt_connected = False; ss.client_thread_started = False; ss.preview_rows = []; ss.diag = []; ss.insecure_tls = False
+    ss.init = True
+    ss.mqtt_client = None
+    ss.mqtt_connected = False
+    ss.diag = []
+    ss.preview_rows = []
+    ss.log_chunks = []
+    ss.log_seq_last = -1
+    ss.log_eof = False
+    ss.auth_ok = False
+    ss.insecure_tls = False
 
-def process_queues():
-    while LOG_QUEUE: ss.diag.append(LOG_QUEUE.popleft())
-    ss.diag = ss.diag[-400:]
-    while DATA_QUEUE:
-        new_rows = DATA_QUEUE.popleft()
-        ss.preview_rows.extend(new_rows)
-        if len(ss.preview_rows) > 6000: ss.preview_rows = ss.preview_rows[-6000:]
-        st.toast(f"🛰️ ¡Se recibieron {len(new_rows)} nuevos puntos de datos!")
-    while STATUS_QUEUE: ss.mqtt_connected = STATUS_QUEUE.popleft()
+# --- Callbacks de MQTT ---
+def on_connect(client, userdata, flags, rc, properties=None):
+    rc_value = rc.value
+    ss.mqtt_connected = (rc_value == 0)
+    rc_map = {0: "OK", 1: "Proto incorrecto", 2: "ID cliente inválido", 3: "Servidor no disponible", 4: "Usuario/Pass incorrecto", 5: "No autorizado"}
+    ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  on_connect rc={rc} ({rc_map.get(rc_value, 'Desconocido')})")
+    if rc_value == 0:
+        client.subscribe([(T_STATE,1),(T_INFO,1),(T_PREVIEW,1),(T_LOGPART,1),(T_EVENTS,0)])
+        ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Suscrito a todos los tópicos.")
 
-process_queues()
+def on_disconnect(client, userdata, rc, properties=None):
+    ss.mqtt_connected = False
+    rc_value = rc.value if not isinstance(rc, int) else rc
+    ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  on_disconnect rc={rc_value}")
 
+def on_message(client, userdata, msg):
+    try:
+        topic = msg.topic
+        payload = msg.payload.decode("utf-8", errors="ignore")
+        if topic == T_PREVIEW:
+            data = json.loads(payload)
+            if isinstance(data, list) and data:
+                ss.preview_rows.extend(data)
+                ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Recibidas {len(data)} filas de preview.")
+                st.toast(f"🛰️ ¡Se recibieron {len(data)} nuevos puntos de datos!")
+        elif topic == T_LOGPART:
+             part = json.loads(payload)
+             seq = int(part.get("seq", -1))
+             eof = bool(part.get("eof", False))
+             data = part.get("data", "")
+             if seq == ss.log_seq_last + 1:
+                 ss.log_chunks.append(data)
+                 ss.log_seq_last = seq
+             else:
+                 ss.log_chunks = [data]
+                 ss.log_seq_last = seq
+             ss.log_eof = eof
+    except Exception as e:
+        ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Error en on_message: {e}")
+
+# --- Funciones de Conexión y Publicación ---
+def connect_mqtt():
+    if ss.mqtt_client: return
+    try:
+        ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Creando cliente MQTT...")
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"st-web-{int(time.time())}", transport="websockets")
+        client.on_connect = on_connect
+        client.on_disconnect = on_disconnect
+        client.on_message = on_message
+        client.username_pw_set(BROKER_USER, BROKER_PASS)
+        client.ws_set_options(path=BROKER_WS_PATH)
+        client.tls_set(cert_reqs=ssl.CERT_REQUIRED)
+        client.tls_insecure_set(bool(ss.insecure_tls))
+        client.connect(BROKER_HOST, BROKER_PORT_WS, keepalive=60)
+        ss.mqtt_client = client
+    except Exception as e:
+        ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  ERROR AL CONECTAR: {e}")
+        ss.mqtt_client = None
+
+def disconnect_mqtt():
+    if ss.mqtt_client:
+        ss.mqtt_client.disconnect()
+        ss.mqtt_client = None
+        ss.mqtt_connected = False
+        ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Cliente desconectado.")
+
+def mqtt_publish(topic, payload_obj):
+    if ss.mqtt_client and ss.mqtt_connected:
+        try:
+            ss.mqtt_client.publish(topic, json.dumps(payload_obj), qos=1)
+            ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  CMD -> {payload_obj}")
+            return True
+        except Exception as e:
+            ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Error al publicar: {e}")
+            return False
+    else:
+        st.warning("No se puede publicar, cliente no conectado.")
+        return False
+
+# --- Barra Lateral (UI) ---
+login_box()
 with st.sidebar:
+    st.markdown("---")
     st.subheader("Conexión")
-    if not ss.client_thread_started:
+    if not ss.mqtt_client:
         if st.button("🔌 Conectar a MQTT", use_container_width=True):
-            threading.Thread(target=mqtt_client_thread, args=(ss.insecure_tls,), daemon=True).start()
-            ss.client_thread_started = True; st.success("Iniciando conexión..."); time.sleep(1); st.rerun()
-    else: st.success("Proceso de conexión iniciado.")
+            connect_mqtt()
+            st.rerun()
+    else:
+        if st.button("🔌 Desconectar", use_container_width=True, type="primary"):
+            disconnect_mqtt()
+            st.rerun()
+
     st.subheader("Estado")
     if ss.mqtt_connected: st.success("🟢 Conectado")
-    else:
-        st.error("🔴 Desconectado")
-        if ss.client_thread_started: st.info("Intentando reconectar...")
+    else: st.error("🔴 Desconectado")
+    
     st.subheader("Opciones")
     ss.insecure_tls = st.checkbox("Usar TLS Inseguro (Debug)", value=ss.insecure_tls)
 
-st.markdown("---")
-st.subheader("Log de Diagnóstico en Tiempo Real")
-st.code("\n".join(ss.diag), language="log", height=200)
+# --- Bucle Principal / "Tick" ---
+if ss.mqtt_client:
+    ss.mqtt_client.loop(timeout=0.1)
 
-time.sleep(3)
+# -------- Controles Principales --------
+st.markdown("---")
+left, mid, right = st.columns([1.4,1,1])
+with left:
+    st.subheader("Iniciar Mision")
+    disabled = not is_editor()
+    with st.form("start_form", clear_on_submit=False):
+        velocity = st.number_input("Velocidad Drone (m/s)", 0.1, 100.0, 10.0, 0.1, disabled=disabled)
+        distance = st.number_input("Distancia entre pelotas (m)", 0.1, 1000.0, 30.0, 0.1, disabled=disabled)
+        delay_s  = st.number_input("Delay de inicio (s)", 0.0, 120.0, 10.0, 1.0, disabled=disabled)
+        step_hz  = st.number_input("Velocidad motor (200 - 1500)", 1, 50000, 200, 10, disabled=disabled)
+        try:
+            st.info(f"Intervalo calculado: **{distance/velocity:.2f} s**" if velocity > 0 else "Intervalo: —")
+        except Exception: st.info("Intervalo: —")
+        
+        start_clicked = st.form_submit_button("🚀 Actualizar Parámetros", disabled=disabled, use_container_width=True)
+        if start_clicked:
+            if is_editor():
+                payload = {"action":"start", "interval_s": float(distance/velocity), "delay_s": float(delay_s), "step_hz": int(step_hz)}
+                if mqtt_publish(T_CMD, payload):
+                    st.success("Comando de INICIO enviado con nuevos parámetros.")
+            else: st.warning("Necesitas ingresar el PIN para iniciar la misión.")
+
+with mid:
+    st.subheader("Paro de emergencia")
+    if st.button("⏹️ Paro Inmediato", type="primary", use_container_width=True):
+        if mqtt_publish(T_CMD, {"action":"stop"}):
+            st.info("Comando STOP enviado")
+
+with right:
+    st.subheader("Solicitar Datos")
+    pvN = st.number_input("Puntos de preview:", 1, 2000, 50, 50)
+    if st.button("📥 Solicitar Preview", use_container_width=True):
+        ss.preview_rows = [] # Limpiar datos antiguos
+        if mqtt_publish(T_CMD, {"action":"preview", "last": int(pvN)}):
+            st.info("Solicitud de preview enviada.")
+    if st.button("⬇️ Descargar Log Completo", use_container_width=True):
+        ss.log_chunks = []; ss.log_seq_last = -1; ss.log_eof = False
+        if mqtt_publish(T_CMD, {"action":"stream_log"}):
+            st.info("Solicitud de log completo enviada.")
+
+# -------- Visualización de Datos (Mapa y Tabla) --------
+st.markdown("---")
+st.subheader("Historial de Ubicaciones")
+
+df_all = pd.DataFrame(ss.preview_rows) if ss.preview_rows else pd.DataFrame(
+    columns=["ts","lat","lon","alt","drop_id","speed_mps","sats","fix_ok"]
+)
+
+day = st.date_input("Escoge un dia", value=date.today())
+st.warning("_**Nota:** Si no ves datos, ¡asegúrate de que la fecha seleccionada sea la correcta!_")
+radius = st.slider("Radio de los puntos (mapa)", 1, 50, 6, 1)
+
+if not df_all.empty:
+    df_all["dt"] = pd.to_datetime(df_all["ts"], unit="s", utc=True).dt.tz_convert("America/Mexico_City")
+    day_start = pd.Timestamp.combine(day, datetime.min.time()).tz_localize("America/Mexico_City")
+    day_end   = pd.Timestamp.combine(day, datetime.max.time()).tz_localize("America/Mexico_City")
+    df_day = df_all[(df_all["dt"] >= day_start) & (df_all["dt"] <= day_end)].copy()
+else:
+    df_day = df_all
+
+m1, m2, m3, m4 = st.columns(4)
+with m1: st.metric("Puntos (día seleccionado)", len(df_day))
+with m2: st.metric("Total de puntos en memoria", len(df_all))
+with m3: st.metric("Puntos con GPS OK", int(df_day["fix_ok"].sum()) if not df_day.empty and "fix_ok" in df_day else 0)
+with m4: st.metric("Velocidad Prom. (m/s)", f"{df_day['speed_mps'].mean():.2f}" if not df_day.empty and "speed_mps" in df_day else "—")
+
+if not df_day.empty and PYDECK_AVAILABLE:
+    st.subheader("Mapa (día seleccionado)")
+    # Filtrar puntos sin latitud o longitud para evitar errores en el mapa
+    df_map = df_day.dropna(subset=['lat', 'lon'])
+    if not df_map.empty:
+        lat0 = float(df_map["lat"].mean())
+        lon0 = float(df_map["lon"].mean())
+        st.pydeck_chart(pdk.Deck(
+            map_style=None,
+            initial_view_state=pdk.ViewState(latitude=lat0, longitude=lon0, zoom=15),
+            layers=[pdk.Layer("ScatterplotLayer", data=df_map,
+                              get_position='[lon, lat]', get_radius=radius,
+                              pickable=True, get_fill_color='[255,0,0]')],
+            tooltip={"text": "Drop #{drop_id}\n{dt}\nlat={lat}\nlon={lon}\nalt={alt} m\nspeed={speed_mps} m/s\nsats={sats}\nfix_ok={fix_ok}"},
+        ))
+elif not PYDECK_AVAILABLE:
+    st.info("La librería Pydeck no está instalada. El mapa no puede mostrarse.")
+
+st.subheader("Tabla de Datos (día seleccionado)")
+if not df_day.empty:
+    st.dataframe(df_day.sort_values("ts", ascending=False), use_container_width=True, height=350)
+else:
+    st.info("No hay datos para mostrar en la fecha seleccionada.")
+
+
+# -------- CSV download (from MQTT chunks) --------
+st.markdown("---")
+st.subheader("Descarga de Log Completo")
+if ss.log_chunks:
+    st.caption(f"Log chunks received: {len(ss.log_chunks)} | EOF: {ss.log_eof}")
+    csv_bytes = "".join(ss.log_chunks).encode("utf-8", errors="ignore")
+    st.download_button(
+        "💾 Descargar CSV",
+        data=csv_bytes,
+        file_name=f"drops-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+else:
+    st.caption("Haz clic en **Descargar Log Completo** para activar la descarga.")
+
+# -------- Logs de Diagnóstico --------
+with st.expander("🔍 Ver Logs de Diagnóstico"):
+    st.code("\n".join(ss.diag[-100:]), language="log")
+
+# --- Auto-refresco ---
+time.sleep(1)
 st.rerun()
 
