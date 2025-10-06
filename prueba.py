@@ -202,10 +202,8 @@ with st.sidebar:
     if ss.mqtt_connected: st.success("🟢 Conectado")
     else: 
         st.error("🔴 Desconectado")
-        st.rerun()
     
     st.subheader("Opciones")
-    ss.insecure_tls = st.checkbox("Usar TLS Inseguro (Debug)", value=ss.insecure_tls)
 
 # --- Bucle Principal / "Tick" ---
 if ss.mqtt_client:
@@ -322,8 +320,9 @@ with st.expander("🔍 Ver Logs de Diagnóstico"):
     st.code("\n".join(ss.diag[-100:]), language="log")
 
 # --- Auto-refresco ---
-time.sleep(30)
+time.sleep(7)
 st.rerun()
+
 
 
 
