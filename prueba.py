@@ -50,7 +50,7 @@ def login_box():
                 st.session_state.auth_ok = False; st.rerun()
 
 # -------- HiveMQ Cloud creds (ACTUALIZA ESTOS VALORES) --------
-BROKER_HOST    = "pinkhoney-186ef38b.a02.usw2.aws.hivemq.cloud"
+BROKER_HOST    = "3f78afad5f2e407c85dd2eb93951af78.s1.eu.hivemq.cloud"
 BROKER_PORT_WS = 8884
 BROKER_WS_PATH = "/mqtt"
 BROKER_USER    = "AdrianFB" # <-- Reemplaza
@@ -322,5 +322,6 @@ with st.expander("🔍 Ver Logs de Diagnóstico"):
 # --- Auto-refresco ---
 time.sleep(8)
 st.rerun()
+
 
 
