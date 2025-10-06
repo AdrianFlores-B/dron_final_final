@@ -82,14 +82,14 @@ if "init" not in ss:
     ss.log_eof = False
     ss.auth_ok = False
     ss.insecure_tls = False
+    ss.messages = [] # <-- NUEVO: Cola para mensajes persistentes
     
-    # --- NUEVO: Carga de datos persistentes y set para duplicados ---
+    # --- Carga de datos persistentes y set para duplicados ---
     ss.seen_points = set()
     try:
         if os.path.exists(DATA_FILE):
             df = pd.read_csv(DATA_FILE)
             ss.preview_rows = df.to_dict('records')
-            # Poblar el set para una rápida verificación de duplicados
             for row in ss.preview_rows:
                 if all(k in row for k in ("ts", "lat", "lon")):
                     unique_tuple = (row['ts'], row['lat'], row['lon'])
@@ -111,7 +111,8 @@ def on_connect(client, userdata, flags, rc, properties=None):
 
 def on_disconnect(client, userdata, rc, properties=None):
     ss.mqtt_connected = False
-    rc_value = rc.value if not isinstance(rc, int) else rc
+    if hasattr(rc, 'value'): rc_value = rc.value
+    else: rc_value = rc
     ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  on_disconnect rc={rc_value}")
 
 def on_message(client, userdata, msg):
@@ -121,7 +122,6 @@ def on_message(client, userdata, msg):
         if topic == T_PREVIEW:
             data = json.loads(payload)
             if isinstance(data, list) and data:
-                # --- NUEVO: Lógica para filtrar duplicados ---
                 new_rows = []
                 for point in data:
                     if all(k in point for k in ("ts", "lat", "lon")):
@@ -135,13 +135,11 @@ def on_message(client, userdata, msg):
                     ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Recibidas y guardadas {len(new_rows)} filas nuevas.")
                     st.toast(f"🛰️ ¡Se guardaron {len(new_rows)} nuevos puntos de datos!")
                     
-                    # Guardar en el archivo CSV
                     new_df = pd.DataFrame(new_rows)
                     header = not os.path.exists(DATA_FILE)
                     new_df.to_csv(DATA_FILE, mode='a', header=header, index=False)
                 else:
                     ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Datos recibidos eran duplicados.")
-        # ... (resto de la lógica de on_message)
     except Exception as e:
         ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Error en on_message: {e}")
 
@@ -151,13 +149,10 @@ def connect_mqtt():
     try:
         ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Creando cliente MQTT...")
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"st-web-{int(time.time())}", transport="websockets")
-        client.on_connect = on_connect
-        client.on_disconnect = on_disconnect
-        client.on_message = on_message
+        client.on_connect = on_connect; client.on_disconnect = on_disconnect; client.on_message = on_message
         client.username_pw_set(BROKER_USER, BROKER_PASS)
         client.ws_set_options(path=BROKER_WS_PATH)
-        client.tls_set(cert_reqs=ssl.CERT_REQUIRED)
-        client.tls_insecure_set(bool(ss.insecure_tls))
+        client.tls_set(cert_reqs=ssl.CERT_REQUIRED); client.tls_insecure_set(bool(ss.insecure_tls))
         client.connect(BROKER_HOST, BROKER_PORT_WS, keepalive=60)
         ss.mqtt_client = client
     except Exception as e:
@@ -167,8 +162,7 @@ def connect_mqtt():
 def disconnect_mqtt():
     if ss.mqtt_client:
         ss.mqtt_client.disconnect()
-        ss.mqtt_client = None
-        ss.mqtt_connected = False
+        ss.mqtt_client = None; ss.mqtt_connected = False
         ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Cliente desconectado.")
 
 def mqtt_publish(topic, payload_obj):
@@ -179,29 +173,25 @@ def mqtt_publish(topic, payload_obj):
             return True
         except Exception as e:
             ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Error al publicar: {e}")
+            ss.messages.append({"type": "error", "text": f"Error al publicar: {e}"})
             return False
     else:
-        st.warning("No se puede publicar, cliente no conectado.")
+        ss.messages.append({"type": "warning", "text": "No se puede publicar, cliente no conectado."})
         return False
 
 # --- Barra Lateral (UI) ---
 login_box()
 with st.sidebar:
-    st.markdown("---")
-    st.subheader("Conexión")
+    st.markdown("---"); st.subheader("Conexión")
     if not ss.mqtt_client:
         if st.button("🔌 Conectar a MQTT", use_container_width=True):
-            connect_mqtt()
-            st.rerun()
+            connect_mqtt(); st.rerun()
     else:
         if st.button("🔌 Desconectar", use_container_width=True, type="primary"):
-            disconnect_mqtt()
-            st.rerun()
-
+            disconnect_mqtt(); st.rerun()
     st.subheader("Estado")
     if ss.mqtt_connected: st.success("🟢 Conectado")
     else: st.error("🔴 Desconectado")
-    
     st.subheader("Opciones")
     ss.insecure_tls = st.checkbox("Usar TLS Inseguro (Debug)", value=ss.insecure_tls)
 
@@ -212,8 +202,12 @@ if ss.mqtt_client:
 # -------- Controles Principales --------
 st.markdown("---")
 left, mid, right = st.columns([1.4,1,1])
+# --- NUEVO: Área para mostrar mensajes persistentes ---
+message_area = st.empty()
+
 with left:
     st.subheader("Iniciar Mision")
+    
     disabled = not is_editor()
     with st.form("start_form", clear_on_submit=False):
         velocity = st.number_input("Velocidad Drone (m/s)", 0.1, 100.0, 10.0, 0.1, disabled=disabled)
@@ -229,25 +223,44 @@ with left:
             if is_editor():
                 payload = {"action":"start", "interval_s": float(distance/velocity), "delay_s": float(delay_s), "step_hz": int(step_hz)}
                 if mqtt_publish(T_CMD, payload):
-                    st.success("Comando de INICIO enviado con nuevos parámetros.")
-            else: st.warning("Necesitas ingresar el PIN para iniciar la misión.")
-
+                    ss.messages.append({"type": "success", "text": "Comando de INICIO enviado con nuevos parámetros."})
+            else: 
+                ss.messages.append({"type": "warning", "text": "Necesitas ingresar el PIN para iniciar la misión."})
+    inicio = st.button("🚀 Inicio", type="primary", use_container_width=True)
+    if inicio:
+        payload = {"action":"start", "interval_s": float(distance/velocity), "delay_s": float(delay_s), "step_hz": int(step_hz)}
+        if mqtt_publish(T_CMD, payload):
+            ss.messages.append({"type": "info", "text": "Comando Inicio enviado."})
+            st.rerun()
 with mid:
     st.subheader("Paro de emergencia")
     if st.button("⏹️ Paro Inmediato", type="primary", use_container_width=True):
         if mqtt_publish(T_CMD, {"action":"stop"}):
-            st.info("Comando STOP enviado")
+            ss.messages.append({"type": "info", "text": "Comando STOP enviado."})
+            st.rerun()
 
 with right:
     st.subheader("Solicitar Datos")
     pvN = st.number_input("Puntos de preview:", 1, 2000, 50, 50)
     if st.button("📥 Solicitar Preview", use_container_width=True):
         if mqtt_publish(T_CMD, {"action":"preview", "last": int(pvN)}):
-            st.info("Solicitud de preview enviada.")
+            ss.messages.append({"type": "info", "text": "Solicitud de preview enviada."})
+            st.rerun()
     if st.button("⬇️ Descargar Log Completo", use_container_width=True):
         ss.log_chunks = []; ss.log_seq_last = -1; ss.log_eof = False
         if mqtt_publish(T_CMD, {"action":"stream_log"}):
-            st.info("Solicitud de log completo enviada.")
+            ss.messages.append({"type": "info", "text": "Solicitud de log completo enviada."})
+            st.rerun()
+
+# --- Lógica para mostrar mensajes ---
+with message_area.container():
+    if "messages" in ss and ss.messages:
+        for msg in ss.messages:
+            if msg["type"] == "success": st.success(msg["text"])
+            elif msg["type"] == "info": st.info(msg["text"])
+            elif msg["type"] == "warning": st.warning(msg["text"])
+            elif msg["type"] == "error": st.error(msg["text"])
+        ss.messages = [] # Limpiar mensajes después de mostrarlos
 
 # -------- Visualización de Datos (Mapa y Tabla) --------
 st.markdown("---")
@@ -299,30 +312,7 @@ else:
     st.info("No hay datos para mostrar en la fecha seleccionada.")
 
 
-# -------- CSV download (from MQTT chunks) --------
-st.markdown("---")
-st.subheader("Descarga de Log Completo")
-if ss.log_chunks:
-    st.caption(f"Log chunks received: {len(ss.log_chunks)} | EOF: {ss.log_eof}")
-    csv_bytes = "".join(ss.log_chunks).encode("utf-8", errors="ignore")
-    st.download_button(
-        "💾 Descargar CSV",
-        data=csv_bytes,
-        file_name=f"drops-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv",
-        mime="text/csv",
-        use_container_width=True
-    )
-else:
-    st.caption("Haz clic en **Descargar Log Completo** para activar la descarga.")
-
-# -------- Logs de Diagnóstico --------
-with st.expander("🔍 Ver Logs de Diagnóstico"):
-    st.code("\n".join(ss.diag[-100:]), language="log")
-
 # --- Auto-refresco ---
 time.sleep(1)
 st.rerun()
-
-
-
 
