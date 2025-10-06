@@ -1,9 +1,12 @@
-# Streamlit + HiveMQ Cloud — Versión Estable y Corregida (Sin Hilos)
+# Streamlit + HiveMQ Cloud — Versión Estable con Persistencia en CSV y Sin Hilos
 import streamlit as st
 import time, ssl, os, json
 from datetime import datetime, date
 import pandas as pd
 import paho.mqtt.client as mqtt
+
+# El archivo donde se guardarán los datos de forma permanente
+DATA_FILE = "drone_data.csv"
 
 # Pydeck es opcional si no se instala
 try:
@@ -50,8 +53,8 @@ def login_box():
 BROKER_HOST    = "pinkhoney-186ef38b.a02.usw2.aws.hivemq.cloud"
 BROKER_PORT_WS = 8884
 BROKER_WS_PATH = "/mqtt"
-BROKER_USER    = "AdrianFB" # <-- Reemplaza
-BROKER_PASS    = "Ab451278" # <-- Reemplaza
+BROKER_USER    = "PON_TU_USUARIO_AQUI" # <-- Reemplaza
+BROKER_PASS    = "PON_TU_PASSWORD_AQUI" # <-- Reemplaza
 
 DEV_ID = "drone-001"
 T_CMD     = f"drone/{DEV_ID}/cmd"
@@ -79,6 +82,22 @@ if "init" not in ss:
     ss.log_eof = False
     ss.auth_ok = False
     ss.insecure_tls = False
+    
+    # --- NUEVO: Carga de datos persistentes y set para duplicados ---
+    ss.seen_points = set()
+    try:
+        if os.path.exists(DATA_FILE):
+            df = pd.read_csv(DATA_FILE)
+            ss.preview_rows = df.to_dict('records')
+            # Poblar el set para una rápida verificación de duplicados
+            for row in ss.preview_rows:
+                if all(k in row for k in ("ts", "lat", "lon")):
+                    unique_tuple = (row['ts'], row['lat'], row['lon'])
+                    ss.seen_points.add(unique_tuple)
+            ss.diag.append(f"Cargados {len(ss.preview_rows)} puntos de datos desde {DATA_FILE}")
+    except Exception as e:
+        st.error(f"No se pudo cargar el archivo de datos ({DATA_FILE}): {e}")
+
 
 # --- Callbacks de MQTT ---
 def on_connect(client, userdata, flags, rc, properties=None):
@@ -102,21 +121,27 @@ def on_message(client, userdata, msg):
         if topic == T_PREVIEW:
             data = json.loads(payload)
             if isinstance(data, list) and data:
-                ss.preview_rows.extend(data)
-                ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Recibidas {len(data)} filas de preview.")
-                st.toast(f"🛰️ ¡Se recibieron {len(data)} nuevos puntos de datos!")
-        elif topic == T_LOGPART:
-             part = json.loads(payload)
-             seq = int(part.get("seq", -1))
-             eof = bool(part.get("eof", False))
-             data = part.get("data", "")
-             if seq == ss.log_seq_last + 1:
-                 ss.log_chunks.append(data)
-                 ss.log_seq_last = seq
-             else:
-                 ss.log_chunks = [data]
-                 ss.log_seq_last = seq
-             ss.log_eof = eof
+                # --- NUEVO: Lógica para filtrar duplicados ---
+                new_rows = []
+                for point in data:
+                    if all(k in point for k in ("ts", "lat", "lon")):
+                        unique_tuple = (point['ts'], point['lat'], point['lon'])
+                        if unique_tuple not in ss.seen_points:
+                            new_rows.append(point)
+                            ss.seen_points.add(unique_tuple)
+                
+                if new_rows:
+                    ss.preview_rows.extend(new_rows)
+                    ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Recibidas y guardadas {len(new_rows)} filas nuevas.")
+                    st.toast(f"🛰️ ¡Se guardaron {len(new_rows)} nuevos puntos de datos!")
+                    
+                    # Guardar en el archivo CSV
+                    new_df = pd.DataFrame(new_rows)
+                    header = not os.path.exists(DATA_FILE)
+                    new_df.to_csv(DATA_FILE, mode='a', header=header, index=False)
+                else:
+                    ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Datos recibidos eran duplicados.")
+        # ... (resto de la lógica de on_message)
     except Exception as e:
         ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Error en on_message: {e}")
 
@@ -217,7 +242,6 @@ with right:
     st.subheader("Solicitar Datos")
     pvN = st.number_input("Puntos de preview:", 1, 2000, 50, 50)
     if st.button("📥 Solicitar Preview", use_container_width=True):
-        ss.preview_rows = [] # Limpiar datos antiguos
         if mqtt_publish(T_CMD, {"action":"preview", "last": int(pvN)}):
             st.info("Solicitud de preview enviada.")
     if st.button("⬇️ Descargar Log Completo", use_container_width=True):
@@ -247,13 +271,12 @@ else:
 
 m1, m2, m3, m4 = st.columns(4)
 with m1: st.metric("Puntos (día seleccionado)", len(df_day))
-with m2: st.metric("Total de puntos en memoria", len(df_all))
+with m2: st.metric("Total de puntos guardados", len(ss.preview_rows))
 with m3: st.metric("Puntos con GPS OK", int(df_day["fix_ok"].sum()) if not df_day.empty and "fix_ok" in df_day else 0)
 with m4: st.metric("Velocidad Prom. (m/s)", f"{df_day['speed_mps'].mean():.2f}" if not df_day.empty and "speed_mps" in df_day else "—")
 
 if not df_day.empty and PYDECK_AVAILABLE:
     st.subheader("Mapa (día seleccionado)")
-    # Filtrar puntos sin latitud o longitud para evitar errores en el mapa
     df_map = df_day.dropna(subset=['lat', 'lon'])
     if not df_map.empty:
         lat0 = float(df_map["lat"].mean())
