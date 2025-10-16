@@ -4,6 +4,7 @@ import time, ssl, os, json
 from datetime import datetime, date
 import pandas as pd
 import paho.mqtt.client as mqtt
+import base64 ### MODIFICACIÓN ###: Importado para el sonido
 
 # El archivo donde se guardarán los datos de forma permanente
 DATA_FILE = "drone_data.csv"
@@ -14,6 +15,9 @@ try:
     PYDECK_AVAILABLE = True
 except ImportError:
     PYDECK_AVAILABLE = False
+
+### MODIFICACIÓN ###: Sonido de éxito codificado para no necesitar archivos externos
+SUCCESS_SOUND_B64 = "UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA="
 
 # ==============================================================================
 # LÓGICA DE LA APLICACIÓN (ARQUITECTURA SIN HILOS)
@@ -57,12 +61,12 @@ BROKER_USER    = "AdrianFB" # <-- Reemplaza
 BROKER_PASS    = "Ab451278" # <-- Reemplaza
 
 DEV_ID = "drone-001"
-T_CMD     = f"drone/{DEV_ID}/cmd"
-T_STATE   = f"drone/{DEV_ID}/state"
-T_INFO    = f"drone/{DEV_ID}/info"
-T_PREVIEW = f"drone/{DEV_ID}/preview"
-T_LOGPART = f"drone/{DEV_ID}/log/part"
-T_EVENTS  = f"drone/{DEV_ID}/events"
+T_CMD      = f"drone/{DEV_ID}/cmd"
+T_STATE    = f"drone/{DEV_ID}/state"
+T_INFO     = f"drone/{DEV_ID}/info"
+T_PREVIEW  = f"drone/{DEV_ID}/preview"
+T_LOGPART  = f"drone/{DEV_ID}/log/part"
+T_EVENTS   = f"drone/{DEV_ID}/events"
 
 # -------- Interfaz y Lógica Principal de Streamlit --------
 st.set_page_config(page_title="Ubicacion y Control de Avispas", layout="wide")
@@ -82,7 +86,12 @@ if "init" not in ss:
     ss.log_eof = False
     ss.auth_ok = False
     ss.insecure_tls = False
-    ss.messages = [] # <-- NUEVO: Cola para mensajes persistentes
+    ss.messages = []
+    
+    ### MODIFICACIÓN ###: Nuevas variables para detectar la conexión de la ESP32
+    ss.info_timestamps = [] # Guarda timestamps de mensajes en T_INFO
+    ss.device_online = False   # Flag para saber si el dispositivo está conectado
+    ss.play_sound = False      # Flag para reproducir el sonido una sola vez
     
     # --- Carga de datos persistentes y set para duplicados ---
     ss.seen_points = set()
@@ -111,6 +120,8 @@ def on_connect(client, userdata, flags, rc, properties=None):
 
 def on_disconnect(client, userdata, rc, properties=None):
     ss.mqtt_connected = False
+    ### MODIFICACIÓN ###: Reiniciar el estado del dispositivo al desconectar
+    ss.device_online = False
     if hasattr(rc, 'value'): rc_value = rc.value
     else: rc_value = rc
     ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  on_disconnect rc={rc_value}")
@@ -119,7 +130,28 @@ def on_message(client, userdata, msg):
     try:
         topic = msg.topic
         payload = msg.payload.decode("utf-8", errors="ignore")
-        if topic == T_PREVIEW:
+        
+        ### MODIFICACIÓN ###: Lógica para detectar si la ESP32 está online
+        if topic == T_INFO:
+            now = time.time()
+            ss.info_timestamps.append(now)
+            
+            # Mantenemos solo los últimos 2 timestamps para no llenar la memoria
+            if len(ss.info_timestamps) > 2:
+                ss.info_timestamps = ss.info_timestamps[-2:]
+            
+            # Si tenemos 2 mensajes y no hemos confirmado la conexión...
+            if len(ss.info_timestamps) == 2 and not ss.device_online:
+                time_diff = ss.info_timestamps[1] - ss.info_timestamps[0]
+                
+                # Si la diferencia es menor a 11 segundos, consideramos que está conectada
+                if time_diff < 11:
+                    ss.device_online = True
+                    ss.play_sound = True # Activa la bandera para reproducir sonido
+                    ss.messages.append({"type": "success", "text": "✅ ¡Conexión con la ESP32 establecida!"})
+                    ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  ESP32 detectada online.")
+        
+        elif topic == T_PREVIEW:
             data = json.loads(payload)
             if isinstance(data, list) and data:
                 new_rows = []
@@ -163,6 +195,8 @@ def disconnect_mqtt():
     if ss.mqtt_client:
         ss.mqtt_client.disconnect()
         ss.mqtt_client = None; ss.mqtt_connected = False
+        ### MODIFICACIÓN ###: Reiniciar el estado del dispositivo
+        ss.device_online = False
         ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Cliente desconectado.")
 
 def mqtt_publish(topic, payload_obj):
@@ -189,9 +223,18 @@ with st.sidebar:
     else:
         if st.button("🔌 Desconectar", use_container_width=True, type="primary"):
             disconnect_mqtt(); st.rerun()
-    st.subheader("Estado")
+            
+    st.subheader("Estado del Servidor")
     if ss.mqtt_connected: st.success("🟢 Conectado")
     else: st.error("🔴 Desconectado")
+
+    ### MODIFICACIÓN ###: Indicador de estado para la ESP32
+    st.subheader("Estado del Dispositivo")
+    if ss.get("device_online", False):
+        st.success("✅ ESP32 Conectada")
+    else:
+        st.warning("⚪ Esperando ESP32...")
+
     st.subheader("Opciones")
     ss.insecure_tls = st.checkbox("Usar TLS Inseguro (Debug)", value=ss.insecure_tls)
 
@@ -199,10 +242,19 @@ with st.sidebar:
 if ss.mqtt_client:
     ss.mqtt_client.loop(timeout=0.1)
 
+### MODIFICACIÓN ###: Lógica para reproducir el sonido
+if ss.get("play_sound", False):
+    sound_html = f"""
+    <audio autoplay>
+      <source src="data:audio/wav;base64,{SUCCESS_SOUND_B64}" type="audio/wav">
+    </audio>
+    """
+    st.components.v1.html(sound_html, height=0)
+    ss.play_sound = False # Se resetea para que no suene en cada rerun
+
 # -------- Controles Principales --------
 st.markdown("---")
 left, mid, right = st.columns([1.4,1,1])
-# --- NUEVO: Área para mostrar mensajes persistentes ---
 message_area = st.empty()
 
 with left:
@@ -315,4 +367,3 @@ else:
 # --- Auto-refresco ---
 time.sleep(1)
 st.rerun()
-
