@@ -223,4 +223,63 @@ with left:
         if st.form_submit_button("🚀 Actualizar Parámetros", disabled=disabled, use_container_width=True):
             if is_editor():
                 payload = {"action":"start", "interval_s": float(distance/velocity), "delay_s": float(delay_s), "step_hz": int(step_hz)}
-                if mqtt_publish(T_CMD, payload): ss.messages.append({"type": "success
+                if mqtt_publish(T_CMD, payload): ss.messages.append({"type": "success", "text": "Parámetros de INICIO enviados."})
+            else: ss.messages.append({"type": "warning", "text": "Necesitas PIN para esta acción."})
+    if st.button("🚀 Inicio", type="primary", use_container_width=True):
+        payload = {"action":"start", "interval_s": float(distance/velocity), "delay_s": float(delay_s), "step_hz": int(step_hz)}
+        if mqtt_publish(T_CMD, payload): ss.messages.append({"type": "info", "text": "Comando Inicio enviado."}); st.rerun()
+
+with mid:
+    st.subheader("Paro de emergencia")
+    if st.button("⏹️ Paro Inmediato", type="primary", use_container_width=True):
+        if mqtt_publish(T_CMD, {"action":"stop"}): ss.messages.append({"type": "info", "text": "Comando STOP enviado."}); st.rerun()
+
+with right:
+    st.subheader("Sincronizar Datos")
+    if st.button("⬇️ Descargar Log Completo", use_container_width=True, disabled=ss.get("download_in_progress", False)):
+        ss.log_chunks = []; ss.download_in_progress = True
+        if mqtt_publish(T_CMD, {"action":"stream_log"}):
+            ss.messages.append({"type": "info", "text": "Solicitando log al dispositivo..."}); st.rerun()
+
+with message_area.container():
+    if ss.get("download_in_progress", False): st.info("📥 Descargando y procesando el log del dispositivo...")
+    for msg in ss.messages:
+        if msg["type"] == "success": st.success(msg["text"])
+        elif msg["type"] == "info": st.info(msg["text"])
+        elif msg["type"] == "warning": st.warning(msg["text"])
+        elif msg["type"] == "error": st.error(msg["text"])
+    ss.messages = []
+
+st.markdown("---")
+st.subheader("Historial de Ubicaciones")
+df_all = pd.DataFrame(ss.all_data_rows) if ss.all_data_rows else pd.DataFrame(columns=CSV_COLUMNS)
+day = st.date_input("Escoge un dia", value=date.today())
+st.warning("_**Nota:** Si no ves datos, asegúrate de que la fecha seleccionada sea la correcta._")
+radius = st.slider("Radio de los puntos (mapa)", 1, 50, 6, 1)
+
+if not df_all.empty:
+    df_all["dt"] = pd.to_datetime(df_all["ts"], unit="s", utc=True).dt.tz_convert("America/Mexico_City")
+    day_start = pd.Timestamp.combine(day, datetime.min.time()).tz_localize("America/Mexico_City")
+    day_end   = pd.Timestamp.combine(day, datetime.max.time()).tz_localize("America/Mexico_City")
+    df_day = df_all[(df_all["dt"] >= day_start) & (df_all["dt"] <= day_end)].copy()
+else: df_day = df_all
+
+m1, m2, m3, m4 = st.columns(4)
+with m1: st.metric("Puntos (día seleccionado)", len(df_day))
+with m2: st.metric("Total de puntos guardados", len(ss.all_data_rows))
+with m3: st.metric("Puntos con GPS OK", int(df_day["fix_ok"].sum()) if "fix_ok" in df_day and not df_day.empty else 0)
+with m4: st.metric("Velocidad Prom. (m/s)", f"{df_day['speed_mps'].mean():.2f}" if "speed_mps" in df_day and not df_day.empty else "—")
+
+if not df_day.empty and PYDECK_AVAILABLE:
+    st.subheader("Mapa (día seleccionado)")
+    df_map = df_day.dropna(subset=['lat', 'lon'])
+    if not df_map.empty:
+        lat0, lon0 = float(df_map["lat"].mean()), float(df_map["lon"].mean())
+        st.pydeck_chart(pdk.Deck(map_style=None, initial_view_state=pdk.ViewState(latitude=lat0, longitude=lon0, zoom=15),
+            layers=[pdk.Layer("ScatterplotLayer", data=df_map, get_position='[lon, lat]', get_radius=radius, pickable=True, get_fill_color='[255,0,0]')],
+            tooltip={"text": "Drop #{drop_id}\n{dt}\nlat={lat}\nlon={lon}\nalt={alt} m\nspeed={speed_mps} m/s\nsats={sats}\nfix_ok={fix_ok}"}))
+
+st.subheader("Tabla de Datos (día seleccionado)")
+st.dataframe(df_day.sort_values("ts", ascending=False), use_container_width=True, height=350) if not df_day.empty else st.info("No hay datos para la fecha seleccionada.")
+
+time.sleep(1); st.rerun()
