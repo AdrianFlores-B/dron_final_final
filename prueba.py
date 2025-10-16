@@ -341,70 +341,54 @@ with message_area.container():
 # =========================================================
 # VISUALIZACIÓN DE DATOS (por defecto: día más reciente)
 # =========================================================
+# -------- Visualización de Datos (Mapa y Tabla) --------
 st.markdown("---")
 st.subheader("Historial de Ubicaciones")
 
+# Carga segura del CSV en memoria ya existente en ss.all_data_rows o archivo
 df_all = pd.DataFrame(ss.all_data_rows) if ss.all_data_rows else pd.DataFrame(
     columns=["ts","lat","lon","alt","drop_id","speed_mps","sats","fix_ok"]
 )
 
-# 1) Si hay datos, crear columna 'dt' y calcular el día más reciente
+# Asegurar tipos de columnas esperadas
 if not df_all.empty:
-    # tz-aware en MX para filtrar por fecha de manera natural
-    df_all["dt"] = pd.to_datetime(df_all["ts"], unit="s", utc=True).dt.tz_convert("America/Mexico_City")
-    latest_day = df_all["dt"].dt.date.max()  # <- día más reciente con datos
-    default_day = latest_day
+    # Forzar numéricos (si viene texto raro del CSV)
+    for c in ["ts","lat","lon","alt","drop_id","speed_mps","sats","fix_ok"]:
+        if c in df_all.columns:
+            df_all[c] = pd.to_numeric(df_all[c], errors="coerce")
+
+    # Timestamps a tz-aware en MX; filas inválidas quedan NaT y se filtran
+    dt_series = pd.to_datetime(df_all["ts"], unit="s", utc=True, errors="coerce")
+    # Guardar columna dt (tz-aware)
+    df_all["dt"] = dt_series.dt.tz_convert("America/Mexico_City")
+
+    # Día más reciente SOLO con valores válidos (sin NaT)
+    valid_days = df_all["dt"].dropna().dt.floor("D")
+    if not valid_days.empty:
+        latest_day = valid_days.max().date()  # ← ya es date puro y sin NaN
+        default_day = latest_day
+    else:
+        default_day = date.today()
 else:
     default_day = date.today()
 
-# 2) El date_input ahora usa por defecto el día más reciente
-day = st.date_input("Selecciona día", value=default_day, key="sel_day")
-st.warning("_Si no ves datos, asegúrate de elegir la fecha correcta según el log._")
-radius = st.slider("Radio de puntos (mapa)", 1, 50, 6, 1)
+# El selector ahora usa default_day calculado
+day = st.date_input("Escoge un dia", value=default_day)
 
-# 3) Filtrado por el día elegido
-if not df_all.empty:
-    day_start = pd.Timestamp.combine(day, datetime.min.time()).tz_localize("America/Mexico_City")
-    day_end   = pd.Timestamp.combine(day, datetime.max.time()).tz_localize("America/Mexico_City")
+st.warning("_**Nota:** Si no ves datos, ¡asegúrate de que la fecha seleccionada sea la correcta!_")
+radius = st.slider("Radio de los puntos (mapa)", 1, 50, 6, 1)
+
+# Filtrado por día (inclusive)
+if not df_all.empty and "dt" in df_all.columns:
+    day_start = pd.Timestamp(day, tz="America/Mexico_City")
+    day_end   = day_start + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
     df_day = df_all[(df_all["dt"] >= day_start) & (df_all["dt"] <= day_end)].copy()
 else:
-    df_day = df_all
-
-# 4) Métricas
-m1,m2,m3,m4 = st.columns(4)
-with m1: st.metric("Puntos (día)", len(df_day))
-with m2: st.metric("Total puntos", len(ss.all_data_rows))
-with m3: st.metric("GPS OK", int(df_day["fix_ok"].sum()) if not df_day.empty else 0)
-with m4: st.metric("Velocidad Prom. (m/s)", f"{df_day['speed_mps'].mean():.2f}" if not df_day.empty else "—")
-
-# 5) Mapa
-if not df_day.empty and PYDECK_AVAILABLE:
-    st.subheader("Mapa (día seleccionado)")
-    df_map = df_day.dropna(subset=["lat","lon"])
-    if not df_map.empty:
-        st.pydeck_chart(pdk.Deck(
-            initial_view_state=pdk.ViewState(latitude=float(df_map["lat"].mean()),
-                                             longitude=float(df_map["lon"].mean()), zoom=15),
-            layers=[pdk.Layer("ScatterplotLayer", data=df_map,
-                              get_position='[lon, lat]', get_radius=radius,
-                              pickable=True, get_fill_color='[255,0,0]')],
-            tooltip={"text":"Drop #{drop_id}\n{dt}\nlat={lat}\nlon={lon}\nalt={alt} m\nspeed={speed_mps} m/s\nsats={sats}"}
-        ))
-elif not PYDECK_AVAILABLE:
-    st.info("Pydeck no instalado → el mapa no se mostrará.")
-
-# 6) Tabla
-st.subheader("Tabla de Datos")
-if not df_day.empty:
-    st.dataframe(df_day.sort_values("ts", ascending=False), use_container_width=True, height=350)
-else:
-    if not df_all.empty and day != default_day:
-        st.info("No hay datos para la fecha seleccionada. Prueba cambiando al día más reciente.")
-    else:
-        st.info("No hay datos para mostrar.")
+    df_day = pd.DataFrame(columns=df_all.columns)
 
 # =========================================================
 # AUTOREFRESCO
 # =========================================================
 time.sleep(1)
 st.rerun()
+
