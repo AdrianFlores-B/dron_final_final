@@ -1,4 +1,4 @@
-# Streamlit + HiveMQ Cloud — Versión Final con Filtro de Seguridad de Datos
+# Streamlit + HiveMQ Cloud — Versión Final con Filtro Manual Fila a Fila
 import streamlit as st
 import time, ssl, os, json
 from datetime import datetime, date
@@ -110,7 +110,7 @@ def on_message(client, userdata, msg):
                 data = json.loads(payload)
                 if not data.get('eof', False):
                     if 'data' in data and 'seq' in data: ss.log_chunks.append(data)
-                else: # Mensaje de Fin de Archivo (EOF). Aquí ocurre la magia.
+                else: # Mensaje de Fin de Archivo (EOF).
                     try:
                         if not ss.log_chunks:
                             ss.messages.append({"type": "warning", "text": "El log del dispositivo está vacío."}); return
@@ -119,19 +119,19 @@ def on_message(client, userdata, msg):
                         ss.log_chunks.sort(key=lambda x: x['seq'])
                         raw_csv_string = "".join(chunk['data'] for chunk in ss.log_chunks)
 
-                        ### MODIFICACIÓN CRÍTICA: Filtro de Seguridad ###
+                        # 2. Dividir en líneas
                         all_lines = raw_csv_string.strip().splitlines()
                         valid_data_rows = []
                         
-                        # 2. Iterar y validar cada línea
+                        # 3. Filtro de Seguridad: Procesar Fila por Fila
                         for line in all_lines:
                             clean_line = line.strip()
-                            # Ignorar el encabezado original y líneas vacías
+                            # Ignorar el encabezado y líneas vacías
                             if 'ts,lat,lon' in clean_line or not clean_line:
                                 continue
                             
                             parts = clean_line.split(',')
-                            # Descartar cualquier línea que no tenga 8 columnas
+                            # Aceptar la fila SÓLO si tiene 8 columnas
                             if len(parts) == len(CSV_COLUMNS):
                                 valid_data_rows.append(parts)
                         
@@ -141,14 +141,15 @@ def on_message(client, userdata, msg):
                         if not valid_data_rows:
                             ss.messages.append({"type": "warning", "text": f"No se encontraron registros válidos entre las {total_received} líneas recibidas."}); return
 
-                        # 3. Reconstruir un DataFrame perfecto a partir de datos ya validados
+                        # 4. Crear un DataFrame SÓLO con las filas validadas
                         df_new = pd.DataFrame(valid_data_rows, columns=CSV_COLUMNS)
-                        # Convertir columnas a tipos numéricos correctos, por si acaso
+                        
+                        # 5. Convertir columnas a tipos numéricos (seguridad extra)
                         for col in df_new.columns:
                             df_new[col] = pd.to_numeric(df_new[col], errors='coerce')
+                        df_new.dropna(inplace=True) # Eliminar filas que fallaron la conversión
 
-                        # 4. Guardar y actualizar la UI
-                        df_new.dropna(inplace=True) # Eliminar filas que no se pudieron convertir a número
+                        # 6. Guardar y actualizar la UI
                         df_new.to_csv(DATA_FILE, index=False)
                         ss.all_data_rows = df_new.to_dict('records')
                         ss.messages.append({"type": "success", "text": f"Log procesado. Se cargaron {len(df_new)} de {total_received} líneas recibidas."})
@@ -157,7 +158,7 @@ def on_message(client, userdata, msg):
                     except Exception as e:
                         ss.messages.append({"type": "error", "text": f"Error al procesar los datos: {e}"})
                     finally:
-                        # 5. Garantizar el desbloqueo de la app
+                        # 7. Garantizar el desbloqueo de la app
                         ss.download_in_progress = False; ss.log_chunks = []
             
             except json.JSONDecodeError:
