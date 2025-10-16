@@ -1,4 +1,4 @@
-# Streamlit + HiveMQ Cloud — Versión Final con Manejo de Log Robusto
+# Streamlit + HiveMQ Cloud — Versión Final con Filtro de Seguridad de Datos
 import streamlit as st
 import time, ssl, os, json
 from datetime import datetime, date
@@ -13,14 +13,12 @@ DATA_FILE = "drone_data.csv"
 # Nombres de las columnas para consistencia
 CSV_COLUMNS = ["ts","lat","lon","alt","drop_id","speed_mps","sats","fix_ok"]
 
-# Pydeck es opcional si no se instala
 try:
     import pydeck as pdk
     PYDECK_AVAILABLE = True
 except ImportError:
     PYDECK_AVAILABLE = False
 
-# Sonido de éxito codificado
 SUCCESS_SOUND_B64 = "UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA="
 
 # ==============================================================================
@@ -55,13 +53,12 @@ def login_box():
             if st.button("Cerrar sesión", use_container_width=True):
                 st.session_state.auth_ok = False; st.rerun()
 
-# -------- HiveMQ Cloud creds --------
+# -------- Credenciales y Tópicos MQTT --------
 BROKER_HOST    = "3f78afad5f2e407c85dd2eb93951af78.s1.eu.hivemq.cloud"
 BROKER_PORT_WS = 8884
 BROKER_WS_PATH = "/mqtt"
 BROKER_USER    = "AdrianFB"
 BROKER_PASS    = "Ab451278"
-
 DEV_ID = "drone-001"
 T_CMD      = f"drone/{DEV_ID}/cmd"
 T_STATE    = f"drone/{DEV_ID}/state"
@@ -76,46 +73,34 @@ ss = st.session_state
 
 if "init" not in ss:
     ss.init = True
-    ss.mqtt_client = None
-    ss.mqtt_connected = False
-    ss.diag = []
-    ss.all_data_rows = []
-    ss.log_chunks = []
-    ss.download_in_progress = False
-    ss.auth_ok = False
-    ss.insecure_tls = False
-    ss.messages = []
-    ss.info_timestamps = []
-    ss.device_online = False
-    ss.play_sound = False
+    ss.mqtt_client = None; ss.mqtt_connected = False
+    ss.diag = []; ss.all_data_rows = []; ss.log_chunks = []
+    ss.download_in_progress = False; ss.auth_ok = False
+    ss.insecure_tls = False; ss.messages = []; ss.info_timestamps = []
+    ss.device_online = False; ss.play_sound = False
     
     try:
         if os.path.exists(DATA_FILE):
-            df = pd.read_csv(DATA_FILE)
-            ss.all_data_rows = df.to_dict('records')
+            df = pd.read_csv(DATA_FILE); ss.all_data_rows = df.to_dict('records')
             ss.diag.append(f"Cargados {len(ss.all_data_rows)} puntos desde {DATA_FILE}")
-    except Exception as e:
-        st.error(f"No se pudo cargar {DATA_FILE}: {e}")
+    except Exception as e: st.error(f"No se pudo cargar {DATA_FILE}: {e}")
 
 # --- Callbacks de MQTT ---
 def on_connect(client, userdata, flags, rc, properties=None):
-    rc_value = rc.value
-    ss.mqtt_connected = (rc_value == 0)
-    if rc_value == 0:
+    ss.mqtt_connected = (rc.value == 0)
+    if ss.mqtt_connected:
         client.subscribe([(T_STATE,1),(T_INFO,1),(T_LOGPART,1),(T_EVENTS,0)])
-        ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')} Suscrito a tópicos.")
+        ss.diag.append("Suscrito a tópicos.")
 
 def on_disconnect(client, userdata, rc, properties=None):
     ss.mqtt_connected = False; ss.device_online = False
 
 def on_message(client, userdata, msg):
     try:
-        topic = msg.topic
-        payload = msg.payload.decode("utf-8", errors="ignore")
+        topic = msg.topic; payload = msg.payload.decode("utf-8", errors="ignore")
 
         if topic == T_INFO:
-            now = time.time()
-            ss.info_timestamps.append(now); ss.info_timestamps = ss.info_timestamps[-2:]
+            now = time.time(); ss.info_timestamps.append(now); ss.info_timestamps = ss.info_timestamps[-2:]
             if len(ss.info_timestamps) == 2 and not ss.device_online and (ss.info_timestamps[1] - ss.info_timestamps[0]) < 11:
                 ss.device_online = True; ss.play_sound = True
                 ss.messages.append({"type": "success", "text": "✅ ¡Conexión con la ESP32 establecida!"})
@@ -125,42 +110,53 @@ def on_message(client, userdata, msg):
                 data = json.loads(payload)
                 if not data.get('eof', False):
                     if 'data' in data and 'seq' in data: ss.log_chunks.append(data)
-                else: # Mensaje de Fin de Archivo (EOF). Procesamos.
+                else: # Mensaje de Fin de Archivo (EOF). Aquí ocurre la magia.
                     try:
                         if not ss.log_chunks:
-                            ss.messages.append({"type": "warning", "text": "El log del dispositivo está vacío."})
-                            return
+                            ss.messages.append({"type": "warning", "text": "El log del dispositivo está vacío."}); return
 
-                        # 1. Ensamblar y limpiar el string del CSV
+                        # 1. Ensamblar el string crudo
                         ss.log_chunks.sort(key=lambda x: x['seq'])
-                        full_csv_string = "".join(chunk['data'] for chunk in ss.log_chunks)
-                        cleaned_csv = full_csv_string.strip() # <-- Limpieza crucial
+                        raw_csv_string = "".join(chunk['data'] for chunk in ss.log_chunks)
 
-                        if not cleaned_csv:
-                            ss.messages.append({"type": "warning", "text": "El log no contenía registros de datos."})
-                            return
+                        ### MODIFICACIÓN CRÍTICA: Filtro de Seguridad ###
+                        all_lines = raw_csv_string.strip().splitlines()
+                        valid_rows = []
+                        
+                        # 2. Iterar y validar cada línea
+                        for line in all_lines:
+                            # Ignorar el encabezado original y líneas vacías
+                            if 'ts' in line or not line.strip():
+                                continue
+                            # Descartar cualquier línea que no tenga 8 columnas
+                            if len(line.split(',')) == len(CSV_COLUMNS):
+                                valid_rows.append(line)
+                        
+                        if not valid_rows:
+                            ss.messages.append({"type": "warning", "text": "No se encontraron registros válidos en el log."}); return
 
-                        # 2. Leer el string limpio con Pandas
-                        csv_file = io.StringIO(cleaned_csv)
-                        df_new = pd.read_csv(csv_file) # Pandas infiere el header de la primera línea
+                        # 3. Reconstruir un CSV perfecto
+                        # Se añade el encabezado al principio y luego se unen las filas válidas.
+                        clean_csv_string = "\n".join([','.join(CSV_COLUMNS)] + valid_rows)
+                        
+                        # 4. Leer el CSV limpio con Pandas (ahora es seguro)
+                        csv_file = io.StringIO(clean_csv_string)
+                        df_new = pd.read_csv(csv_file)
 
-                        # 3. Guardar y actualizar la UI
+                        # 5. Guardar y actualizar la UI
                         df_new.to_csv(DATA_FILE, index=False)
                         ss.all_data_rows = df_new.to_dict('records')
-                        ss.messages.append({"type": "success", "text": f"Log procesado. Se cargaron {len(df_new)} registros."})
+                        ss.messages.append({"type": "success", "text": f"Log procesado. Se cargaron {len(df_new)} registros válidos."})
                         st.toast(f"✅ Log actualizado: {len(df_new)} registros.")
                     
                     except Exception as e:
-                        ss.messages.append({"type": "error", "text": f"Error al procesar los datos del log: {e}"})
-                        ss.diag.append(f"Error en procesamiento CSV: {e}")
+                        ss.messages.append({"type": "error", "text": f"Error al procesar los datos: {e}"})
                     finally:
-                        # 4. ESTE BLOQUE ES EL MÁS IMPORTANTE:
-                        # Se ejecuta siempre (con éxito o error) para desbloquear la app.
-                        ss.download_in_progress = False
-                        ss.log_chunks = []
+                        # 6. Garantizar el desbloqueo de la app
+                        ss.download_in_progress = False; ss.log_chunks = []
             
             except json.JSONDecodeError:
-                ss.messages.append({"type": "error", "text": "Error de comunicación: Se recibió un dato corrupto."})
+                ss.messages.append({"type": "error", "text": "Error: Se recibió un dato corrupto."})
                 ss.download_in_progress = False; ss.log_chunks = []
 
     except Exception as e:
@@ -174,27 +170,19 @@ def connect_mqtt():
     try:
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"st-web-{int(time.time())}", transport="websockets")
         client.on_connect = on_connect; client.on_disconnect = on_disconnect; client.on_message = on_message
-        client.username_pw_set(BROKER_USER, BROKER_PASS)
-        client.ws_set_options(path=BROKER_WS_PATH)
+        client.username_pw_set(BROKER_USER, BROKER_PASS); client.ws_set_options(path=BROKER_WS_PATH)
         client.tls_set(cert_reqs=ssl.CERT_REQUIRED); client.tls_insecure_set(bool(ss.insecure_tls))
-        client.connect(BROKER_HOST, BROKER_PORT_WS, keepalive=60)
-        ss.mqtt_client = client
-    except Exception as e:
-        ss.diag.append(f"ERROR AL CONECTAR: {e}"); ss.mqtt_client = None
+        client.connect(BROKER_HOST, BROKER_PORT_WS, keepalive=60); ss.mqtt_client = client
+    except Exception as e: ss.diag.append(f"ERROR AL CONECTAR: {e}"); ss.mqtt_client = None
 
 def disconnect_mqtt():
-    if ss.mqtt_client:
-        ss.mqtt_client.disconnect()
-        ss.mqtt_client = None; ss.mqtt_connected = False; ss.device_online = False
+    if ss.mqtt_client: ss.mqtt_client.disconnect(); ss.mqtt_client = None; ss.mqtt_connected = False; ss.device_online = False
 
 def mqtt_publish(topic, payload_obj):
     if ss.mqtt_client and ss.mqtt_connected:
-        try:
-            ss.mqtt_client.publish(topic, json.dumps(payload_obj), qos=1); return True
-        except Exception as e:
-            ss.messages.append({"type": "error", "text": f"Error al publicar: {e}"})
-    else:
-        ss.messages.append({"type": "warning", "text": "Cliente no conectado."})
+        try: ss.mqtt_client.publish(topic, json.dumps(payload_obj), qos=1); return True
+        except Exception as e: ss.messages.append({"type": "error", "text": f"Error al publicar: {e}"})
+    else: ss.messages.append({"type": "warning", "text": "Cliente no conectado."})
     return False
 
 # --- UI ---
@@ -205,13 +193,9 @@ with st.sidebar:
         if st.button("🔌 Conectar a MQTT", use_container_width=True): connect_mqtt(); st.rerun()
     else:
         if st.button("🔌 Desconectar", use_container_width=True, type="primary"): disconnect_mqtt(); st.rerun()
-            
-    st.subheader("Estado del Servidor")
-    st.success("🟢 Conectado") if ss.mqtt_connected else st.error("🔴 Desconectado")
-    st.subheader("Estado del Dispositivo")
-    st.success("✅ ESP32 Conectada") if ss.get("device_online", False) else st.warning("⚪ Esperando ESP32...")
-    st.subheader("Opciones")
-    ss.insecure_tls = st.checkbox("Usar TLS Inseguro (Debug)", value=ss.insecure_tls)
+    st.subheader("Estado del Servidor"); st.success("🟢 Conectado") if ss.mqtt_connected else st.error("🔴 Desconectado")
+    st.subheader("Estado del Dispositivo"); st.success("✅ ESP32 Conectada") if ss.get("device_online", False) else st.warning("⚪ Esperando ESP32...")
+    st.subheader("Opciones"); ss.insecure_tls = st.checkbox("Usar TLS Inseguro (Debug)", value=ss.insecure_tls)
 
 if ss.mqtt_client: ss.mqtt_client.loop(timeout=0.1)
 if ss.get("play_sound", False):
@@ -223,8 +207,7 @@ left, mid, right = st.columns([1.4,1,1])
 message_area = st.empty()
 
 with left:
-    st.subheader("Iniciar Mision")
-    disabled = not is_editor()
+    st.subheader("Iniciar Mision"); disabled = not is_editor()
     with st.form("start_form", clear_on_submit=False):
         velocity = st.number_input("Velocidad Drone (m/s)", 0.1, 100.0, 10.0, 0.1, disabled=disabled)
         distance = st.number_input("Distancia entre pelotas (m)", 0.1, 1000.0, 30.0, 0.1, disabled=disabled)
@@ -232,7 +215,6 @@ with left:
         step_hz  = st.number_input("Velocidad motor (200 - 1500)", 1, 50000, 200, 10, disabled=disabled)
         try: st.info(f"Intervalo calculado: **{distance/velocity:.2f} s**" if velocity > 0 else "Intervalo: —")
         except: st.info("Intervalo: —")
-        
         if st.form_submit_button("🚀 Actualizar Parámetros", disabled=disabled, use_container_width=True):
             if is_editor():
                 payload = {"action":"start", "interval_s": float(distance/velocity), "delay_s": float(delay_s), "step_hz": int(step_hz)}
@@ -265,9 +247,7 @@ with message_area.container():
 
 st.markdown("---")
 st.subheader("Historial de Ubicaciones")
-
 df_all = pd.DataFrame(ss.all_data_rows) if ss.all_data_rows else pd.DataFrame(columns=CSV_COLUMNS)
-
 day = st.date_input("Escoge un dia", value=date.today())
 st.warning("_**Nota:** Si no ves datos, asegúrate de que la fecha seleccionada sea la correcta._")
 radius = st.slider("Radio de los puntos (mapa)", 1, 50, 6, 1)
@@ -293,8 +273,6 @@ if not df_day.empty and PYDECK_AVAILABLE:
         st.pydeck_chart(pdk.Deck(map_style=None, initial_view_state=pdk.ViewState(latitude=lat0, longitude=lon0, zoom=15),
             layers=[pdk.Layer("ScatterplotLayer", data=df_map, get_position='[lon, lat]', get_radius=radius, pickable=True, get_fill_color='[255,0,0]')],
             tooltip={"text": "Drop #{drop_id}\n{dt}\nlat={lat}\nlon={lon}\nalt={alt} m\nspeed={speed_mps} m/s\nsats={sats}\nfix_ok={fix_ok}"}))
-elif not PYDECK_AVAILABLE:
-    st.info("Pydeck no está instalado. El mapa no puede mostrarse.")
 
 st.subheader("Tabla de Datos (día seleccionado)")
 st.dataframe(df_day.sort_values("ts", ascending=False), use_container_width=True, height=350) if not df_day.empty else st.info("No hay datos para la fecha seleccionada.")
