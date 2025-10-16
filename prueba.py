@@ -1,10 +1,11 @@
-# Streamlit + HiveMQ Cloud — Versión Estable con Persistencia en CSV y Sin Hilos
+# Streamlit + HiveMQ Cloud — Versión con Descarga de Log Completo
 import streamlit as st
 import time, ssl, os, json
 from datetime import datetime, date
 import pandas as pd
 import paho.mqtt.client as mqtt
-import base64 ### MODIFICACIÓN ###: Importado para el sonido
+import base64
+import io ### MODIFICACIÓN ###: Necesario para leer strings como si fueran archivos
 
 # El archivo donde se guardarán los datos de forma permanente
 DATA_FILE = "drone_data.csv"
@@ -16,11 +17,11 @@ try:
 except ImportError:
     PYDECK_AVAILABLE = False
 
-### MODIFICACIÓN ###: Sonido de éxito codificado para no necesitar archivos externos
+# Sonido de éxito codificado para no necesitar archivos externos
 SUCCESS_SOUND_B64 = "UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA="
 
 # ==============================================================================
-# LÓGICA DE LA APLICACIÓN (ARQUITECTURA SIN HILOS)
+# LÓGICA DE LA APLICACIÓN
 # ==============================================================================
 
 # ===================== SIMPLE LOGIN (PIN) =====================
@@ -53,19 +54,18 @@ def login_box():
             if st.button("Cerrar sesión", use_container_width=True):
                 st.session_state.auth_ok = False; st.rerun()
 
-# -------- HiveMQ Cloud creds (ACTUALIZA ESTOS VALORES) --------
+# -------- HiveMQ Cloud creds --------
 BROKER_HOST    = "3f78afad5f2e407c85dd2eb93951af78.s1.eu.hivemq.cloud"
 BROKER_PORT_WS = 8884
 BROKER_WS_PATH = "/mqtt"
-BROKER_USER    = "AdrianFB" # <-- Reemplaza
-BROKER_PASS    = "Ab451278" # <-- Reemplaza
+BROKER_USER    = "AdrianFB"
+BROKER_PASS    = "Ab451278"
 
 DEV_ID = "drone-001"
 T_CMD      = f"drone/{DEV_ID}/cmd"
 T_STATE    = f"drone/{DEV_ID}/state"
 T_INFO     = f"drone/{DEV_ID}/info"
-T_PREVIEW  = f"drone/{DEV_ID}/preview"
-T_LOGPART  = f"drone/{DEV_ID}/log/part"
+T_LOGPART  = f"drone/{DEV_ID}/log/part" ### MODIFICACIÓN ###: T_PREVIEW ya no se usa
 T_EVENTS   = f"drone/{DEV_ID}/events"
 
 # -------- Interfaz y Lógica Principal de Streamlit --------
@@ -80,30 +80,24 @@ if "init" not in ss:
     ss.mqtt_client = None
     ss.mqtt_connected = False
     ss.diag = []
-    ss.preview_rows = []
+    ss.all_data_rows = [] # ### MODIFICACIÓN ###: Renombrado de preview_rows para más claridad
     ss.log_chunks = []
     ss.log_seq_last = -1
     ss.log_eof = False
+    ss.download_in_progress = False ### MODIFICACIÓN ###: Flag para mostrar estado de descarga
     ss.auth_ok = False
     ss.insecure_tls = False
     ss.messages = []
+    ss.info_timestamps = []
+    ss.device_online = False
+    ss.play_sound = False
     
-    ### MODIFICACIÓN ###: Nuevas variables para detectar la conexión de la ESP32
-    ss.info_timestamps = [] # Guarda timestamps de mensajes en T_INFO
-    ss.device_online = False   # Flag para saber si el dispositivo está conectado
-    ss.play_sound = False      # Flag para reproducir el sonido una sola vez
-    
-    # --- Carga de datos persistentes y set para duplicados ---
-    ss.seen_points = set()
+    # --- Carga de datos persistentes ---
     try:
         if os.path.exists(DATA_FILE):
             df = pd.read_csv(DATA_FILE)
-            ss.preview_rows = df.to_dict('records')
-            for row in ss.preview_rows:
-                if all(k in row for k in ("ts", "lat", "lon")):
-                    unique_tuple = (row['ts'], row['lat'], row['lon'])
-                    ss.seen_points.add(unique_tuple)
-            ss.diag.append(f"Cargados {len(ss.preview_rows)} puntos de datos desde {DATA_FILE}")
+            ss.all_data_rows = df.to_dict('records')
+            ss.diag.append(f"Cargados {len(ss.all_data_rows)} puntos de datos desde {DATA_FILE}")
     except Exception as e:
         st.error(f"No se pudo cargar el archivo de datos ({DATA_FILE}): {e}")
 
@@ -115,12 +109,12 @@ def on_connect(client, userdata, flags, rc, properties=None):
     rc_map = {0: "OK", 1: "Proto incorrecto", 2: "ID cliente inválido", 3: "Servidor no disponible", 4: "Usuario/Pass incorrecto", 5: "No autorizado"}
     ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  on_connect rc={rc} ({rc_map.get(rc_value, 'Desconocido')})")
     if rc_value == 0:
-        client.subscribe([(T_STATE,1),(T_INFO,1),(T_PREVIEW,1),(T_LOGPART,1),(T_EVENTS,0)])
-        ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Suscrito a todos los tópicos.")
+        ### MODIFICACIÓN ###: Se quita la suscripción a T_PREVIEW
+        client.subscribe([(T_STATE,1),(T_INFO,1),(T_LOGPART,1),(T_EVENTS,0)])
+        ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Suscrito a tópicos principales.")
 
 def on_disconnect(client, userdata, rc, properties=None):
     ss.mqtt_connected = False
-    ### MODIFICACIÓN ###: Reiniciar el estado del dispositivo al desconectar
     ss.device_online = False
     if hasattr(rc, 'value'): rc_value = rc.value
     else: rc_value = rc
@@ -131,49 +125,58 @@ def on_message(client, userdata, msg):
         topic = msg.topic
         payload = msg.payload.decode("utf-8", errors="ignore")
         
-        ### MODIFICACIÓN ###: Lógica para detectar si la ESP32 está online
         if topic == T_INFO:
             now = time.time()
             ss.info_timestamps.append(now)
+            if len(ss.info_timestamps) > 2: ss.info_timestamps = ss.info_timestamps[-2:]
             
-            # Mantenemos solo los últimos 2 timestamps para no llenar la memoria
-            if len(ss.info_timestamps) > 2:
-                ss.info_timestamps = ss.info_timestamps[-2:]
-            
-            # Si tenemos 2 mensajes y no hemos confirmado la conexión...
             if len(ss.info_timestamps) == 2 and not ss.device_online:
-                time_diff = ss.info_timestamps[1] - ss.info_timestamps[0]
-                
-                # Si la diferencia es menor a 11 segundos, consideramos que está conectada
-                if time_diff < 11:
+                if (ss.info_timestamps[1] - ss.info_timestamps[0]) < 11:
                     ss.device_online = True
-                    ss.play_sound = True # Activa la bandera para reproducir sonido
+                    ss.play_sound = True
                     ss.messages.append({"type": "success", "text": "✅ ¡Conexión con la ESP32 establecida!"})
                     ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  ESP32 detectada online.")
         
-        elif topic == T_PREVIEW:
+        ### MODIFICACIÓN ###: Nueva lógica para recibir y procesar los chunks del log
+        elif topic == T_LOGPART:
             data = json.loads(payload)
-            if isinstance(data, list) and data:
-                new_rows = []
-                for point in data:
-                    if all(k in point for k in ("ts", "lat", "lon")):
-                        unique_tuple = (point['ts'], point['lat'], point['lon'])
-                        if unique_tuple not in ss.seen_points:
-                            new_rows.append(point)
-                            ss.seen_points.add(unique_tuple)
+            
+            if not data.get('eof', False):
+                # Es un chunk de datos, lo guardamos
+                ss.log_chunks.append(data)
+            else:
+                # Es el final de la transmisión (EOF)
+                ss.download_in_progress = False
+                ss.log_eof = True
+                ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Recepción de log finalizada. {len(ss.log_chunks)} chunks.")
+
+                if not ss.log_chunks:
+                    ss.messages.append({"type": "warning", "text": "El dispositivo no reportó datos en el log."})
+                    return
+
+                # 1. Ordenar chunks por número de secuencia y unirlos en un solo string
+                sorted_chunks = sorted(ss.log_chunks, key=lambda x: x['seq'])
+                full_csv_string = "".join([chunk['data'] for chunk in sorted_chunks])
                 
-                if new_rows:
-                    ss.preview_rows.extend(new_rows)
-                    ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Recibidas y guardadas {len(new_rows)} filas nuevas.")
-                    st.toast(f"🛰️ ¡Se guardaron {len(new_rows)} nuevos puntos de datos!")
-                    
-                    new_df = pd.DataFrame(new_rows)
-                    header = not os.path.exists(DATA_FILE)
-                    new_df.to_csv(DATA_FILE, mode='a', header=header, index=False)
-                else:
-                    ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Datos recibidos eran duplicados.")
+                # 2. Usar io.StringIO para leer el string como un archivo en memoria con Pandas
+                csv_file = io.StringIO(full_csv_string)
+                df_new = pd.read_csv(csv_file)
+                
+                # 3. Sobrescribir el archivo local y actualizar el estado de la sesión
+                df_new.to_csv(DATA_FILE, index=False)
+                ss.all_data_rows = df_new.to_dict('records')
+                
+                ss.messages.append({"type": "success", "text": f"Log completo procesado. Se cargaron {len(df_new)} registros."})
+                st.toast(f"✅ ¡Log descargado y actualizado con {len(df_new)} registros!")
+
+                # 4. Limpiar para la próxima descarga
+                ss.log_chunks = []
+                ss.log_seq_last = -1
+
     except Exception as e:
         ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Error en on_message: {e}")
+        ss.download_in_progress = False
+
 
 # --- Funciones de Conexión y Publicación ---
 def connect_mqtt():
@@ -195,7 +198,6 @@ def disconnect_mqtt():
     if ss.mqtt_client:
         ss.mqtt_client.disconnect()
         ss.mqtt_client = None; ss.mqtt_connected = False
-        ### MODIFICACIÓN ###: Reiniciar el estado del dispositivo
         ss.device_online = False
         ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Cliente desconectado.")
 
@@ -228,7 +230,6 @@ with st.sidebar:
     if ss.mqtt_connected: st.success("🟢 Conectado")
     else: st.error("🔴 Desconectado")
 
-    ### MODIFICACIÓN ###: Indicador de estado para la ESP32
     st.subheader("Estado del Dispositivo")
     if ss.get("device_online", False):
         st.success("✅ ESP32 Conectada")
@@ -242,15 +243,10 @@ with st.sidebar:
 if ss.mqtt_client:
     ss.mqtt_client.loop(timeout=0.1)
 
-### MODIFICACIÓN ###: Lógica para reproducir el sonido
 if ss.get("play_sound", False):
-    sound_html = f"""
-    <audio autoplay>
-      <source src="data:audio/wav;base64,{SUCCESS_SOUND_B64}" type="audio/wav">
-    </audio>
-    """
+    sound_html = f'<audio autoplay><source src="data:audio/wav;base64,{SUCCESS_SOUND_B64}" type="audio/wav"></audio>'
     st.components.v1.html(sound_html, height=0)
-    ss.play_sound = False # Se resetea para que no suene en cada rerun
+    ss.play_sound = False
 
 # -------- Controles Principales --------
 st.markdown("---")
@@ -259,7 +255,6 @@ message_area = st.empty()
 
 with left:
     st.subheader("Iniciar Mision")
-    
     disabled = not is_editor()
     with st.form("start_form", clear_on_submit=False):
         velocity = st.number_input("Velocidad Drone (m/s)", 0.1, 100.0, 10.0, 0.1, disabled=disabled)
@@ -270,55 +265,53 @@ with left:
             st.info(f"Intervalo calculado: **{distance/velocity:.2f} s**" if velocity > 0 else "Intervalo: —")
         except Exception: st.info("Intervalo: —")
         
-        start_clicked = st.form_submit_button("🚀 Actualizar Parámetros", disabled=disabled, use_container_width=True)
-        if start_clicked:
+        if st.form_submit_button("🚀 Actualizar Parámetros", disabled=disabled, use_container_width=True):
             if is_editor():
                 payload = {"action":"start", "interval_s": float(distance/velocity), "delay_s": float(delay_s), "step_hz": int(step_hz)}
                 if mqtt_publish(T_CMD, payload):
                     ss.messages.append({"type": "success", "text": "Comando de INICIO enviado con nuevos parámetros."})
             else: 
                 ss.messages.append({"type": "warning", "text": "Necesitas ingresar el PIN para iniciar la misión."})
-    inicio = st.button("🚀 Inicio", type="primary", use_container_width=True)
-    if inicio:
+    if st.button("🚀 Inicio", type="primary", use_container_width=True):
         payload = {"action":"start", "interval_s": float(distance/velocity), "delay_s": float(delay_s), "step_hz": int(step_hz)}
         if mqtt_publish(T_CMD, payload):
-            ss.messages.append({"type": "info", "text": "Comando Inicio enviado."})
-            st.rerun()
+            ss.messages.append({"type": "info", "text": "Comando Inicio enviado."}); st.rerun()
+
 with mid:
     st.subheader("Paro de emergencia")
     if st.button("⏹️ Paro Inmediato", type="primary", use_container_width=True):
         if mqtt_publish(T_CMD, {"action":"stop"}):
-            ss.messages.append({"type": "info", "text": "Comando STOP enviado."})
-            st.rerun()
+            ss.messages.append({"type": "info", "text": "Comando STOP enviado."}); st.rerun()
 
+### MODIFICACIÓN ###: Lógica de la columna derecha simplificada
 with right:
-    st.subheader("Solicitar Datos")
-    pvN = st.number_input("Puntos de preview:", 1, 2000, 50, 50)
-    if st.button("📥 Solicitar Preview", use_container_width=True):
-        if mqtt_publish(T_CMD, {"action":"preview", "last": int(pvN)}):
-            ss.messages.append({"type": "info", "text": "Solicitud de preview enviada."})
-            st.rerun()
-    if st.button("⬇️ Descargar Log Completo", use_container_width=True):
+    st.subheader("Sincronizar Datos")
+    if st.button("⬇️ Descargar Log Completo", use_container_width=True, disabled=ss.get("download_in_progress", False)):
+        # Preparamos el estado para una nueva descarga
         ss.log_chunks = []; ss.log_seq_last = -1; ss.log_eof = False
+        ss.download_in_progress = True
         if mqtt_publish(T_CMD, {"action":"stream_log"}):
-            ss.messages.append({"type": "info", "text": "Solicitud de log completo enviada."})
+            ss.messages.append({"type": "info", "text": "Solicitud de log enviada. Recibiendo datos..."})
             st.rerun()
 
 # --- Lógica para mostrar mensajes ---
 with message_area.container():
+    if ss.get("download_in_progress", False):
+        st.info("📥 Descargando y procesando el log del dispositivo. Por favor, espere...")
+    
     if "messages" in ss and ss.messages:
         for msg in ss.messages:
             if msg["type"] == "success": st.success(msg["text"])
             elif msg["type"] == "info": st.info(msg["text"])
             elif msg["type"] == "warning": st.warning(msg["text"])
             elif msg["type"] == "error": st.error(msg["text"])
-        ss.messages = [] # Limpiar mensajes después de mostrarlos
+        ss.messages = []
 
 # -------- Visualización de Datos (Mapa y Tabla) --------
 st.markdown("---")
 st.subheader("Historial de Ubicaciones")
 
-df_all = pd.DataFrame(ss.preview_rows) if ss.log_chunks else pd.DataFrame(
+df_all = pd.DataFrame(ss.all_data_rows) if ss.all_data_rows else pd.DataFrame(
     columns=["ts","lat","lon","alt","drop_id","speed_mps","sats","fix_ok"]
 )
 
@@ -336,7 +329,7 @@ else:
 
 m1, m2, m3, m4 = st.columns(4)
 with m1: st.metric("Puntos (día seleccionado)", len(df_day))
-with m2: st.metric("Total de puntos guardados", len(ss.preview_rows))
+with m2: st.metric("Total de puntos guardados", len(ss.all_data_rows))
 with m3: st.metric("Puntos con GPS OK", int(df_day["fix_ok"].sum()) if not df_day.empty and "fix_ok" in df_day else 0)
 with m4: st.metric("Velocidad Prom. (m/s)", f"{df_day['speed_mps'].mean():.2f}" if not df_day.empty and "speed_mps" in df_day else "—")
 
@@ -367,4 +360,3 @@ else:
 # --- Auto-refresco ---
 time.sleep(1)
 st.rerun()
-
