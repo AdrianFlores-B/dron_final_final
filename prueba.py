@@ -318,7 +318,7 @@ with message_area.container():
 st.markdown("---")
 st.subheader("Historial de Ubicaciones")
 
-df_all = pd.DataFrame(ss.preview_rows) if ss.preview_rows else pd.DataFrame(
+df_all = pd.DataFrame(ss.preview_rows) if ss.log_chunks else pd.DataFrame(
     columns=["ts","lat","lon","alt","drop_id","speed_mps","sats","fix_ok"]
 )
 
@@ -367,3 +367,4 @@ else:
 # --- Auto-refresco ---
 time.sleep(1)
 st.rerun()
+
