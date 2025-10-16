@@ -242,7 +242,7 @@ with right:
     if st.button("🔄 Sincronizar con Dispositivo", use_container_width=True, disabled=ss.get("sync_in_progress", False)):
         ss.sync_in_progress = True
         ss.new_points_count = 0
-        if mqtt_publish(T_CMD, {"action":"preview", "last": 9999}):
+        if mqtt_publish(T_CMD, {"action":"preview", "last": 50}):
             ss.messages.append({"type": "info", "text": "Solicitando datos al dispositivo..."}); st.rerun()
 
 with message_area.container():
@@ -291,3 +291,4 @@ st.subheader("Tabla de Datos (día seleccionado)")
 st.dataframe(df_day.sort_values("ts", ascending=False), use_container_width=True, height=350) if not df_day.empty else st.info("No hay datos para la fecha seleccionada.")
 
 time.sleep(1); st.rerun()
+
