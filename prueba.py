@@ -1,11 +1,11 @@
-# Streamlit + HiveMQ Cloud — Versión con Descarga de Log Completo
+# Streamlit + HiveMQ Cloud — Versión con Descarga de Log Completo (Robusta)
 import streamlit as st
 import time, ssl, os, json
 from datetime import datetime, date
 import pandas as pd
 import paho.mqtt.client as mqtt
 import base64
-import io ### MODIFICACIÓN ###: Necesario para leer strings como si fueran archivos
+import io
 
 # El archivo donde se guardarán los datos de forma permanente
 DATA_FILE = "drone_data.csv"
@@ -65,7 +65,7 @@ DEV_ID = "drone-001"
 T_CMD      = f"drone/{DEV_ID}/cmd"
 T_STATE    = f"drone/{DEV_ID}/state"
 T_INFO     = f"drone/{DEV_ID}/info"
-T_LOGPART  = f"drone/{DEV_ID}/log/part" ### MODIFICACIÓN ###: T_PREVIEW ya no se usa
+T_LOGPART  = f"drone/{DEV_ID}/log/part"
 T_EVENTS   = f"drone/{DEV_ID}/events"
 
 # -------- Interfaz y Lógica Principal de Streamlit --------
@@ -80,11 +80,9 @@ if "init" not in ss:
     ss.mqtt_client = None
     ss.mqtt_connected = False
     ss.diag = []
-    ss.all_data_rows = [] # ### MODIFICACIÓN ###: Renombrado de preview_rows para más claridad
+    ss.all_data_rows = []
     ss.log_chunks = []
-    ss.log_seq_last = -1
-    ss.log_eof = False
-    ss.download_in_progress = False ### MODIFICACIÓN ###: Flag para mostrar estado de descarga
+    ss.download_in_progress = False
     ss.auth_ok = False
     ss.insecure_tls = False
     ss.messages = []
@@ -92,7 +90,6 @@ if "init" not in ss:
     ss.device_online = False
     ss.play_sound = False
     
-    # --- Carga de datos persistentes ---
     try:
         if os.path.exists(DATA_FILE):
             df = pd.read_csv(DATA_FILE)
@@ -101,7 +98,6 @@ if "init" not in ss:
     except Exception as e:
         st.error(f"No se pudo cargar el archivo de datos ({DATA_FILE}): {e}")
 
-
 # --- Callbacks de MQTT ---
 def on_connect(client, userdata, flags, rc, properties=None):
     rc_value = rc.value
@@ -109,7 +105,6 @@ def on_connect(client, userdata, flags, rc, properties=None):
     rc_map = {0: "OK", 1: "Proto incorrecto", 2: "ID cliente inválido", 3: "Servidor no disponible", 4: "Usuario/Pass incorrecto", 5: "No autorizado"}
     ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  on_connect rc={rc} ({rc_map.get(rc_value, 'Desconocido')})")
     if rc_value == 0:
-        ### MODIFICACIÓN ###: Se quita la suscripción a T_PREVIEW
         client.subscribe([(T_STATE,1),(T_INFO,1),(T_LOGPART,1),(T_EVENTS,0)])
         ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Suscrito a tópicos principales.")
 
@@ -120,11 +115,12 @@ def on_disconnect(client, userdata, rc, properties=None):
     else: rc_value = rc
     ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  on_disconnect rc={rc_value}")
 
+### MODIFICACIÓN ###: Función on_message completamente reescrita para ser más robusta
 def on_message(client, userdata, msg):
     try:
         topic = msg.topic
         payload = msg.payload.decode("utf-8", errors="ignore")
-        
+
         if topic == T_INFO:
             now = time.time()
             ss.info_timestamps.append(now)
@@ -135,59 +131,65 @@ def on_message(client, userdata, msg):
                     ss.device_online = True
                     ss.play_sound = True
                     ss.messages.append({"type": "success", "text": "✅ ¡Conexión con la ESP32 establecida!"})
-                    ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  ESP32 detectada online.")
         
-        ### MODIFICACIÓN ###: Lógica mejorada para T_LOGPART con manejo de errores robusto
         elif topic == T_LOGPART:
             try:
                 data = json.loads(payload)
                 
-                # Es un chunk de datos, lo guardamos
                 if not data.get('eof', False):
-                    ss.log_chunks.append(data)
-                
-                # Es el final de la transmisión (EOF)
+                    # Es un chunk de datos, lo guardamos si tiene contenido
+                    if 'data' in data and 'seq' in data:
+                        ss.log_chunks.append(data)
                 else:
-                    ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Recepción de log finalizada. {len(ss.log_chunks)} chunks.")
+                    # Mensaje de Fin de Archivo (EOF). Procesamos los chunks acumulados.
+                    ss.diag.append(f"EOF recibido. Procesando {len(ss.log_chunks)} chunks.")
+                    try:
+                        if not ss.log_chunks:
+                            ss.messages.append({"type": "warning", "text": "Descarga completada, pero el log estaba vacío."})
+                        else:
+                            # Ordenamos y unimos todos los datos en un solo string
+                            ss.log_chunks.sort(key=lambda x: x['seq'])
+                            full_csv_string = "".join(chunk['data'] for chunk in ss.log_chunks)
 
-                    if not ss.log_chunks:
-                        ss.messages.append({"type": "warning", "text": "El dispositivo no reportó datos en el log."})
-                    else:
-                        # 1. Ordenar chunks y unirlos
-                        sorted_chunks = sorted(ss.log_chunks, key=lambda x: x['seq'])
-                        full_csv_string = "".join([chunk['data'] for chunk in sorted_chunks])
-                        
-                        # 2. Leer el string como un archivo CSV con Pandas
-                        csv_file = io.StringIO(full_csv_string)
-                        df_new = pd.read_csv(csv_file)
-                        
-                        # 3. Guardar el archivo y actualizar el estado de la sesión
-                        df_new.to_csv(DATA_FILE, index=False)
-                        ss.all_data_rows = df_new.to_dict('records')
-                        
-                        ss.messages.append({"type": "success", "text": f"Log completo procesado. Se cargaron {len(df_new)} registros."})
-                        st.toast(f"✅ ¡Log descargado y actualizado con {len(df_new)} registros!")
+                            if not full_csv_string.strip():
+                                ss.messages.append({"type": "warning", "text": "El log no contenía registros de datos."})
+                            else:
+                                # Leemos el string como si fuera un archivo CSV
+                                csv_file = io.StringIO(full_csv_string)
+                                df_new = pd.read_csv(csv_file)
+                                
+                                # Guardamos el archivo y actualizamos la app
+                                df_new.to_csv(DATA_FILE, index=False)
+                                ss.all_data_rows = df_new.to_dict('records')
+                                
+                                ss.messages.append({"type": "success", "text": f"Log procesado. Se cargaron {len(df_new)} registros."})
+                                st.toast(f"✅ Log actualizado: {len(df_new)} registros.")
                     
-                    # 4. Limpiar para la próxima descarga (¡esto es crucial!)
-                    ss.log_chunks = []
-                    ss.log_seq_last = -1
-                    ss.download_in_progress = False # <-- Vuelve a habilitar el botón
-            
-            except json.JSONDecodeError:
-                # Si el payload no es un JSON válido, lo reportamos y reseteamos el estado
-                ss.diag.append(f"Error: Payload en T_LOGPART no es un JSON válido. Payload: {payload}")
-                ss.messages.append({"type": "error", "text": "Error de comunicación. Se recibió un dato corrupto desde el dispositivo."})
-                ss.download_in_progress = False # <-- Vuelve a habilitar el botón
-            except Exception as e:
-                # Captura cualquier otro error durante el procesamiento
-                ss.diag.append(f"Error procesando chunk de log: {e}")
-                ss.messages.append({"type": "error", "text": f"Error procesando datos: {e}"})
-                ss.download_in_progress = False # <-- Vuelve a habilitar el botón
+                    except pd.errors.EmptyDataError:
+                        ss.messages.append({"type": "error", "text": "Error al procesar: El log estaba vacío o mal formado."})
+                    except Exception as e:
+                        ss.messages.append({"type": "error", "text": f"Error al procesar los datos del log: {e}"})
+                        ss.diag.append(f"Error durante el procesamiento del CSV: {e}")
+                    finally:
+                        # ESTE BLOQUE ES CRÍTICO: Se ejecuta siempre (con éxito o error)
+                        # para limpiar el estado y rehabilitar el botón.
+                        ss.log_chunks = []
+                        ss.download_in_progress = False
 
-    # Este es el `except` general para toda la función on_message
+            except json.JSONDecodeError:
+                ss.messages.append({"type": "error", "text": "Error de comunicación: Se recibió un dato corrupto."})
+                ss.diag.append(f"JSONDecodeError en payload: {payload}")
+                ss.download_in_progress = False
+                ss.log_chunks = []
+
     except Exception as e:
-        ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Error mayor en on_message: {e}")
-        ss.download_in_progress = False # Asegurarse de resetear aquí también como último recurso
+        ss.diag.append(f"Error mayor en on_message: {e}")
+        ss.messages.append({"type": "error", "text": "Ocurrió un error inesperado en la comunicación."})
+        if 'download_in_progress' in ss:
+            ss.download_in_progress = False
+        if 'log_chunks' in ss:
+            ss.log_chunks = []
+
 
 # --- Funciones de Conexión y Publicación ---
 def connect_mqtt():
@@ -294,12 +296,10 @@ with mid:
         if mqtt_publish(T_CMD, {"action":"stop"}):
             ss.messages.append({"type": "info", "text": "Comando STOP enviado."}); st.rerun()
 
-### MODIFICACIÓN ###: Lógica de la columna derecha simplificada
 with right:
     st.subheader("Sincronizar Datos")
     if st.button("⬇️ Descargar Log Completo", use_container_width=True, disabled=ss.get("download_in_progress", False)):
-        # Preparamos el estado para una nueva descarga
-        ss.log_chunks = []; ss.log_seq_last = -1; ss.log_eof = False
+        ss.log_chunks = []
         ss.download_in_progress = True
         if mqtt_publish(T_CMD, {"action":"stream_log"}):
             ss.messages.append({"type": "info", "text": "Solicitud de log enviada. Recibiendo datos..."})
