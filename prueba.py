@@ -1,16 +1,15 @@
-# Streamlit + HiveMQ Cloud — Versión con Descarga de Log Completo (Robusta v2)
+# Streamlit + HiveMQ Cloud — Versión Final con Sincronización JSON
 import streamlit as st
 import time, ssl, os, json
 from datetime import datetime, date
 import pandas as pd
 import paho.mqtt.client as mqtt
 import base64
-import io
 
 # El archivo donde se guardarán los datos de forma permanente
 DATA_FILE = "drone_data.csv"
 
-### MODIFICACIÓN ###: Definimos explícitamente las columnas del CSV
+# Nombres de las columnas para consistencia
 CSV_COLUMNS = ["ts","lat","lon","alt","drop_id","speed_mps","sats","fix_ok"]
 
 # Pydeck es opcional si no se instala
@@ -20,7 +19,7 @@ try:
 except ImportError:
     PYDECK_AVAILABLE = False
 
-# Sonido de éxito codificado para no necesitar archivos externos
+# Sonido de éxito codificado
 SUCCESS_SOUND_B64 = "UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA="
 
 # ==============================================================================
@@ -66,8 +65,8 @@ DEV_ID = "drone-001"
 T_CMD      = f"drone/{DEV_ID}/cmd"
 T_STATE    = f"drone/{DEV_ID}/state"
 T_INFO     = f"drone/{DEV_ID}/info"
-T_LOGPART  = f"drone/{DEV_ID}/log/part"
-T_EVENTS   = f"drone/{DEV_ID}/events"
+T_PREVIEW  = f"drone/{DEV_ID}/preview" # <-- Tópico que ahora usaremos
+T_EVENTS   = f"drone/{DEV_ID}/events"   # <-- Tópico para saber cuándo termina la sync
 
 st.set_page_config(page_title="Ubicacion y Control de Avispas", layout="wide")
 st.title("🛰️ Ubicacion y Control de Avispas")
@@ -80,8 +79,9 @@ if "init" not in ss:
     ss.mqtt_connected = False
     ss.diag = []
     ss.all_data_rows = []
-    ss.log_chunks = []
-    ss.download_in_progress = False
+    ss.seen_points = set()
+    ss.sync_in_progress = False
+    ss.new_points_count = 0
     ss.auth_ok = False
     ss.insecure_tls = False
     ss.messages = []
@@ -93,6 +93,11 @@ if "init" not in ss:
         if os.path.exists(DATA_FILE):
             df = pd.read_csv(DATA_FILE)
             ss.all_data_rows = df.to_dict('records')
+            # Llenar el set de puntos vistos para evitar duplicados al inicio
+            for row in ss.all_data_rows:
+                if all(k in row for k in ("ts", "lat", "lon")):
+                    unique_tuple = (row['ts'], row['lat'], row['lon'])
+                    ss.seen_points.add(unique_tuple)
             ss.diag.append(f"Cargados {len(ss.all_data_rows)} puntos desde {DATA_FILE}")
     except Exception as e:
         st.error(f"No se pudo cargar {DATA_FILE}: {e}")
@@ -102,7 +107,7 @@ def on_connect(client, userdata, flags, rc, properties=None):
     rc_value = rc.value
     ss.mqtt_connected = (rc_value == 0)
     if rc_value == 0:
-        client.subscribe([(T_STATE,1),(T_INFO,1),(T_LOGPART,1),(T_EVENTS,0)])
+        client.subscribe([(T_STATE,1),(T_INFO,1),(T_PREVIEW,1),(T_EVENTS,0)])
         ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')} Suscrito a tópicos.")
 
 def on_disconnect(client, userdata, rc, properties=None):
@@ -116,64 +121,42 @@ def on_message(client, userdata, msg):
 
         if topic == T_INFO:
             now = time.time()
-            ss.info_timestamps.append(now)
-            if len(ss.info_timestamps) > 2: ss.info_timestamps.pop(0)
-            
-            if len(ss.info_timestamps) == 2 and not ss.device_online:
-                if (ss.info_timestamps[1] - ss.info_timestamps[0]) < 11:
-                    ss.device_online = True; ss.play_sound = True
-                    ss.messages.append({"type": "success", "text": "✅ ¡Conexión con la ESP32 establecida!"})
+            ss.info_timestamps.append(now); ss.info_timestamps = ss.info_timestamps[-2:]
+            if len(ss.info_timestamps) == 2 and not ss.device_online and (ss.info_timestamps[1] - ss.info_timestamps[0]) < 11:
+                ss.device_online = True; ss.play_sound = True
+                ss.messages.append({"type": "success", "text": "✅ ¡Conexión con la ESP32 establecida!"})
         
-        elif topic == T_LOGPART:
-            try:
-                data = json.loads(payload)
-                
-                if not data.get('eof', False):
-                    if 'data' in data and 'seq' in data: ss.log_chunks.append(data)
+        elif topic == T_PREVIEW:
+            if not ss.sync_in_progress: return # Ignorar datos si no estamos sincronizando
+            
+            data = json.loads(payload)
+            if isinstance(data, list):
+                for point in data:
+                    if all(k in point for k in ("ts", "lat", "lon")):
+                        unique_tuple = (point['ts'], point['lat'], point['lon'])
+                        if unique_tuple not in ss.seen_points:
+                            ss.all_data_rows.append(point)
+                            ss.seen_points.add(unique_tuple)
+                            ss.new_points_count += 1
+
+        elif topic == T_EVENTS:
+            if payload.startswith("preview_done") and ss.sync_in_progress:
+                ss.sync_in_progress = False
+                if ss.new_points_count > 0:
+                    # Guardar los datos actualizados en el archivo CSV
+                    df_updated = pd.DataFrame(ss.all_data_rows)
+                    df_updated.to_csv(DATA_FILE, index=False)
+                    ss.messages.append({"type": "success", text: f"Sincronización completa. Se agregaron {ss.new_points_count} nuevos registros."})
+                    st.toast(f"✅ Se agregaron {ss.new_points_count} nuevos puntos.")
                 else:
-                    try:
-                        if not ss.log_chunks:
-                            ss.messages.append({"type": "warning", "text": "Descarga completada, pero el log estaba vacío."})
-                        else:
-                            ss.log_chunks.sort(key=lambda x: x['seq'])
-                            full_csv_string = "".join(chunk['data'] for chunk in ss.log_chunks)
-
-                            if not full_csv_string.strip():
-                                ss.messages.append({"type": "warning", "text": "El log no contenía registros de datos."})
-                            else:
-                                csv_file = io.StringIO(full_csv_string)
-                                
-                                ### MODIFICACIÓN CRÍTICA ###
-                                # Le decimos a Pandas exactamente cómo leer los datos
-                                df_new = pd.read_csv(
-                                    csv_file,
-                                    names=CSV_COLUMNS,    # Usa estos nombres de columna
-                                    header=0,             # La fila 0 es el header, ignórala
-                                    on_bad_lines='skip'   # Si una línea es errónea, sáltala
-                                )
-                                
-                                df_new.to_csv(DATA_FILE, index=False)
-                                ss.all_data_rows = df_new.to_dict('records')
-                                ss.messages.append({"type": "success", "text": f"Log procesado. Se cargaron {len(df_new)} registros."})
-                                st.toast(f"✅ Log actualizado: {len(df_new)} registros.")
-                    
-                    except Exception as e:
-                        ss.messages.append({"type": "error", "text": f"Error al procesar los datos del log: {e}"})
-                        ss.diag.append(f"Error en procesamiento CSV: {e}")
-                    finally:
-                        # Este bloque garantiza que la app se desbloquee sin importar lo que pase
-                        ss.log_chunks = []
-                        ss.download_in_progress = False
-
-            except json.JSONDecodeError:
-                ss.messages.append({"type": "error", "text": "Error de comunicación: Se recibió un dato corrupto."})
-                ss.download_in_progress = False
-                ss.log_chunks = []
+                    ss.messages.append({"type": "info", text: "Sincronización completa. No se encontraron nuevos registros."})
+                ss.new_points_count = 0 # Resetear contador
 
     except Exception as e:
-        ss.diag.append(f"Error mayor en on_message: {e}")
-        if 'download_in_progress' in ss: ss.download_in_progress = False
-        if 'log_chunks' in ss: ss.log_chunks = []
+        ss.diag.append(f"Error en on_message: {e}")
+        if ss.sync_in_progress:
+            ss.messages.append({"type": "error", "text": f"Error durante la sincronización: {e}"})
+            ss.sync_in_progress = False
 
 def connect_mqtt():
     if ss.mqtt_client: return
@@ -256,13 +239,14 @@ with mid:
 
 with right:
     st.subheader("Sincronizar Datos")
-    if st.button("⬇️ Descargar Log Completo", use_container_width=True, disabled=ss.get("download_in_progress", False)):
-        ss.log_chunks = []; ss.download_in_progress = True
-        if mqtt_publish(T_CMD, {"action":"stream_log"}):
-            ss.messages.append({"type": "info", "text": "Solicitud de log enviada..."}); st.rerun()
+    if st.button("🔄 Sincronizar con Dispositivo", use_container_width=True, disabled=ss.get("sync_in_progress", False)):
+        ss.sync_in_progress = True
+        ss.new_points_count = 0
+        if mqtt_publish(T_CMD, {"action":"preview", "last": 9999}):
+            ss.messages.append({"type": "info", "text": "Solicitando datos al dispositivo..."}); st.rerun()
 
 with message_area.container():
-    if ss.get("download_in_progress", False): st.info("📥 Descargando y procesando el log del dispositivo...")
+    if ss.get("sync_in_progress", False): st.info("📥 Sincronizando datos con el dispositivo...")
     for msg in ss.messages:
         if msg["type"] == "success": st.success(msg["text"])
         elif msg["type"] == "info": st.info(msg["text"])
@@ -289,7 +273,7 @@ else: df_day = df_all
 m1, m2, m3, m4 = st.columns(4)
 with m1: st.metric("Puntos (día seleccionado)", len(df_day))
 with m2: st.metric("Total de puntos guardados", len(ss.all_data_rows))
-with m3: st.metric("Puntos con GPS OK", int(df_day["fix_ok"].sum()) if "fix_ok" in df_day else 0)
+with m3: st.metric("Puntos con GPS OK", int(df_day["fix_ok"].sum()) if "fix_ok" in df_day and not df_day.empty else 0)
 with m4: st.metric("Velocidad Prom. (m/s)", f"{df_day['speed_mps'].mean():.2f}" if "speed_mps" in df_day and not df_day.empty else "—")
 
 if not df_day.empty and PYDECK_AVAILABLE:
