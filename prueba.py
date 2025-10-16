@@ -101,6 +101,25 @@ if "init" not in ss:
     except Exception as e:
         st.error(f"No se pudo cargar el archivo de datos ({DATA_FILE}): {e}")
 
+
+# --- Callbacks de MQTT ---
+def on_connect(client, userdata, flags, rc, properties=None):
+    rc_value = rc.value
+    ss.mqtt_connected = (rc_value == 0)
+    rc_map = {0: "OK", 1: "Proto incorrecto", 2: "ID cliente inválido", 3: "Servidor no disponible", 4: "Usuario/Pass incorrecto", 5: "No autorizado"}
+    ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  on_connect rc={rc} ({rc_map.get(rc_value, 'Desconocido')})")
+    if rc_value == 0:
+        ### MODIFICACIÓN ###: Se quita la suscripción a T_PREVIEW
+        client.subscribe([(T_STATE,1),(T_INFO,1),(T_LOGPART,1),(T_EVENTS,0)])
+        ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Suscrito a tópicos principales.")
+
+def on_disconnect(client, userdata, rc, properties=None):
+    ss.mqtt_connected = False
+    ss.device_online = False
+    if hasattr(rc, 'value'): rc_value = rc.value
+    else: rc_value = rc
+    ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  on_disconnect rc={rc_value}")
+
 def on_message(client, userdata, msg):
     try:
         topic = msg.topic
@@ -169,70 +188,6 @@ def on_message(client, userdata, msg):
     except Exception as e:
         ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Error mayor en on_message: {e}")
         ss.download_in_progress = False # Asegurarse de resetear aquí también como último recurso
-def on_disconnect(client, userdata, rc, properties=None):
-    ss.mqtt_connected = False
-    ss.device_online = False
-    if hasattr(rc, 'value'): rc_value = rc.value
-    else: rc_value = rc
-    ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  on_disconnect rc={rc_value}")
-
-def on_message(client, userdata, msg):
-    try:
-        topic = msg.topic
-        payload = msg.payload.decode("utf-8", errors="ignore")
-        
-        if topic == T_INFO:
-            now = time.time()
-            ss.info_timestamps.append(now)
-            if len(ss.info_timestamps) > 2: ss.info_timestamps = ss.info_timestamps[-2:]
-            
-            if len(ss.info_timestamps) == 2 and not ss.device_online:
-                if (ss.info_timestamps[1] - ss.info_timestamps[0]) < 11:
-                    ss.device_online = True
-                    ss.play_sound = True
-                    ss.messages.append({"type": "success", "text": "✅ ¡Conexión con la ESP32 establecida!"})
-                    ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  ESP32 detectada online.")
-        
-        ### MODIFICACIÓN ###: Nueva lógica para recibir y procesar los chunks del log
-        elif topic == T_LOGPART:
-            data = json.loads(payload)
-            
-            if not data.get('eof', False):
-                # Es un chunk de datos, lo guardamos
-                ss.log_chunks.append(data)
-            else:
-                # Es el final de la transmisión (EOF)
-                ss.download_in_progress = False
-                ss.log_eof = True
-                ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Recepción de log finalizada. {len(ss.log_chunks)} chunks.")
-
-                if not ss.log_chunks:
-                    ss.messages.append({"type": "warning", "text": "El dispositivo no reportó datos en el log."})
-                    return
-
-                # 1. Ordenar chunks por número de secuencia y unirlos en un solo string
-                sorted_chunks = sorted(ss.log_chunks, key=lambda x: x['seq'])
-                full_csv_string = "".join([chunk['data'] for chunk in sorted_chunks])
-                
-                # 2. Usar io.StringIO para leer el string como un archivo en memoria con Pandas
-                csv_file = io.StringIO(full_csv_string)
-                df_new = pd.read_csv(csv_file)
-                
-                # 3. Sobrescribir el archivo local y actualizar el estado de la sesión
-                df_new.to_csv(DATA_FILE, index=False)
-                ss.all_data_rows = df_new.to_dict('records')
-                
-                ss.messages.append({"type": "success", "text": f"Log completo procesado. Se cargaron {len(df_new)} registros."})
-                st.toast(f"✅ ¡Log descargado y actualizado con {len(df_new)} registros!")
-
-                # 4. Limpiar para la próxima descarga
-                ss.log_chunks = []
-                ss.log_seq_last = -1
-
-    except Exception as e:
-        ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')}  Error en on_message: {e}")
-        ss.download_in_progress = False
-
 
 # --- Funciones de Conexión y Publicación ---
 def connect_mqtt():
@@ -416,4 +371,3 @@ else:
 # --- Auto-refresco ---
 time.sleep(1)
 st.rerun()
-
