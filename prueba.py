@@ -303,7 +303,6 @@ with st.sidebar:
     if not ss.mqtt_client:
         if st.button("🔌 Conectar a MQTT", width="stretch"):
             connect_mqtt()
-            st.rerun()
     else:
         if st.button("🔌 Desconectar", width="stretch", type="primary"):
             disconnect_mqtt()
@@ -494,3 +493,4 @@ if not ss.log_collecting:
             ss.mqtt_client.loop(timeout=0.1)
     time.sleep(0.2)
     st.rerun()
+
