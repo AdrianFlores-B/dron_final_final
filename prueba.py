@@ -332,7 +332,6 @@ if ss.play_sound:
 # =========================================================
 st.markdown("---")
 left, mid, right = st.columns([1.4, 1, 1])
-message_area = st.empty()
 
 with left:
     st.subheader("Iniciar Misión")
@@ -492,5 +491,6 @@ if not ss.log_collecting:
             ss.mqtt_client.loop(timeout=0.1)
     time.sleep(0.2)
     st.rerun()
+
 
 
