@@ -147,8 +147,7 @@ def on_message(client, userdata, msg):
                 if (ss.info_timestamps[1] - ss.info_timestamps[0]) < 11:
                     ss.device_online = True
                     ss.play_sound = True
-                    ss.messages.append({"type":"success","text":"✅ ¡Conexión con la ESP32 establecida!"})
-                    ss.diag.append(f"{datetime.now().strftime('%H:%M:%S')} ESP32 online detectada.")
+                    
 
         elif topic == T_LOGPART:
             data = json.loads(payload)
@@ -493,4 +492,5 @@ if not ss.log_collecting:
             ss.mqtt_client.loop(timeout=0.1)
     time.sleep(0.2)
     st.rerun()
+
 
